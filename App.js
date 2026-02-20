@@ -34,22 +34,35 @@ function MainTabs() {
     <Tab.Navigator
       screenOptions={({ route }) => ({
         headerShown: false,
-        tabBarActiveTintColor: theme.colors.primary,
-        tabBarInactiveTintColor: 'gray',
+        tabBarActiveTintColor: 'rgba(255, 200, 220, 1)',
+        tabBarInactiveTintColor: 'rgba(255, 255, 255, 0.4)',
         tabBarStyle: {
           height: 75,
           paddingBottom: 8,
-          borderTopLeftRadius: 25,
-          borderTopRightRadius: 25,
-          backgroundColor: 'white',
+          borderTopLeftRadius: 35,
+          borderTopRightRadius: 35,
+          borderBottomLeftRadius: 35,
+          borderBottomRightRadius: 35,
+          backgroundColor: '#2d1b2e',
+          borderTopWidth: 1,
+          borderTopColor: 'rgba(255, 200, 220, 0.2)',
           position: 'absolute',
+          bottom: 12,
+          left: 12,
+          right: 12,
+          shadowColor: '#000',
+          shadowOpacity: 0.4,
+          shadowOffset: { width: 0, height: 12 },
+          shadowRadius: 20,
+          elevation: 15,
+          borderWidth: 1,
+          borderColor: 'rgba(255, 200, 220, 0.15)',
         },
         tabBarIcon: ({ color }) => {
           const icons = {
             "Track Me": "location-outline",
             "Record": "mic-outline",
             "SOS": "alert-circle-outline",
-            "Chatbot": "chatbubbles-outline",
             "Routes": "map-outline",
           };
           return <Ionicons name={icons[route.name]} size={26} color={color} />;
@@ -59,7 +72,6 @@ function MainTabs() {
       <Tab.Screen name="Track Me" component={TrackMeScreen} />
       <Tab.Screen name="Record" component={RecordScreen} />
       <Tab.Screen name="SOS" component={SosScreen} />
-      <Tab.Screen name="Chatbot" component={ChatbotScreen} />
       <Tab.Screen name="Routes" component={RoutesScreen} />
     </Tab.Navigator>
   );
@@ -89,6 +101,7 @@ export default function App() {
         {user ? (
           <>
             <Stack.Screen name="MainTabs" component={MainTabs} />
+            <Stack.Screen name="ChatbotScreen" component={ChatbotScreen} options={{ presentation: 'modal' }} />
             <Stack.Screen name="MenuScreen" component={MenuScreen} />
             <Stack.Screen name="ProfileScreen" component={ProfileScreen} />
             <Stack.Screen name="RecordingsHistory" component={RecordingsHistoryScreen} />

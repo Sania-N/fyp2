@@ -1,5 +1,5 @@
 import { GEMINI_API_KEY } from '@env';
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -12,10 +12,12 @@ import {
   SafeAreaView,
   ActivityIndicator,
 } from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import Header from '../components/Header';
 import theme from '../styles/theme';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 
 
@@ -26,6 +28,7 @@ export default function ChatbotScreen() {
   const [messages, setMessages] = useState([
     { id: '1', text: 'Hi! I’m your AI Safety Assistant. How can I help you today?', sender: 'bot' },
   ]);
+  const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -84,6 +87,40 @@ export default function ChatbotScreen() {
     }
   };
 
+  useEffect(() => {
+    const loadMessages = async () => {
+      try {
+        const raw = await AsyncStorage.getItem('@chat_messages');
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setMessages(parsed);
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to load chat messages:', e);
+      } finally {
+        setHydrated(true);
+      }
+    };
+
+    loadMessages();
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+
+    const save = async () => {
+      try {
+        await AsyncStorage.setItem('@chat_messages', JSON.stringify(messages));
+      } catch (e) {
+        console.warn('Failed to save chat messages:', e);
+      }
+    };
+
+    save();
+  }, [messages, hydrated]);
+
   const renderItem = ({ item }) => (
     <View
       style={[
@@ -103,61 +140,67 @@ export default function ChatbotScreen() {
   );
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <Header />
-      <KeyboardAvoidingView
-        style={styles.flex}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      >
-        <View style={styles.container}>
-          <Text style={styles.title}>AI Chat Assistant</Text>
+    <LinearGradient 
+      colors={['#2d1b2e', '#3d0d3d', '#1a3d4f']} 
+      style={{ flex: 1 }}
+    >
+      <SafeAreaView style={styles.safeArea}>
+        <Header />
+        <KeyboardAvoidingView
+          style={styles.flex}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
+          <View style={styles.container}>
+            <Text style={styles.title}>AI Chat Assistant</Text>
 
-          <FlatList
-            data={messages}
-            keyExtractor={(item) => item.id}
-            renderItem={renderItem}
-            contentContainerStyle={styles.chatContainer}
-          />
+            <FlatList
+              data={messages}
+              keyExtractor={(item) => item.id}
+              renderItem={renderItem}
+              contentContainerStyle={styles.chatContainer}
+            />
 
-          {loading && (
-            <View style={styles.typingIndicator}>
-              <ActivityIndicator size="small" color={theme.colors.primary} />
-              <Text style={styles.typingText}>AI is typing...</Text>
-            </View>
-          )}
-        </View>
+            {loading && (
+              <View style={styles.typingIndicator}>
+                <ActivityIndicator size="small" color="#fff" />
+                <Text style={styles.typingText}>AI is typing...</Text>
+              </View>
+            )}
+          </View>
 
-        {/* Input Area - Positioned Above Navigation */}
-        <View style={styles.inputContainer}>
-          <TextInput
-            placeholder="Type your message..."
-            style={styles.input}
-            value={input}
-            onChangeText={setInput}
-          />
-          <TouchableOpacity style={styles.sendButton} onPress={sendMessage} disabled={loading}>
-            <Ionicons name="send" size={22} color="#fff" />
-          </TouchableOpacity>
-        </View>
-      </KeyboardAvoidingView>
-    </SafeAreaView>
+          {/* Input Area - Positioned Above Navigation */}
+          <View style={styles.inputContainer}>
+            <TextInput
+              placeholder="Type your message..."
+              style={styles.input}
+              value={input}
+              onChangeText={setInput}
+              placeholderTextColor="rgba(255, 255, 255, 0.5)"
+            />
+            <TouchableOpacity style={styles.sendButton} onPress={sendMessage} disabled={loading}>
+              <Ionicons name="send" size={22} color="rgba(255, 200, 220, 1)" />
+            </TouchableOpacity>
+          </View>
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    </LinearGradient>
   );
 }
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
-  safeArea: { flex: 1, backgroundColor: '#fff' },
+  safeArea: { flex: 1, backgroundColor: 'transparent' },
   container: {
     flex: 1,
     paddingHorizontal: 15,
     paddingBottom: 10,
-    backgroundColor: '#fff',
+    backgroundColor: 'transparent',
   },
   title: {
     fontSize: 22,
     fontWeight: '700',
     marginVertical: 10,
-    color: theme.colors.primary,
+    color: '#fff',
   },
   chatContainer: {
     flexGrow: 1,
@@ -171,17 +214,19 @@ const styles = StyleSheet.create({
     marginVertical: 6,
   },
   userBubble: {
-    backgroundColor: theme.colors.primary,
+    backgroundColor: 'rgba(128, 0, 32, 0.8)',
     alignSelf: 'flex-end',
     borderBottomRightRadius: 0,
   },
   botBubble: {
-    backgroundColor: '#F1F1F1',
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
     alignSelf: 'flex-start',
     borderBottomLeftRadius: 0,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
   },
   messageText: {
-    color: '#000',
+    color: '#fff',
     fontSize: 15,
   },
   typingIndicator: {
@@ -190,29 +235,34 @@ const styles = StyleSheet.create({
     marginBottom: 5,
     paddingLeft: 10,
   },
-  typingText: { marginLeft: 6, color: 'gray', fontStyle: 'italic' },
+  typingText: { marginLeft: 6, color: 'rgba(255, 255, 255, 0.7)', fontStyle: 'italic' },
   inputContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#F5F5F5',
+    backgroundColor: 'rgba(77, 20, 60, 0.4)',
     paddingHorizontal: 12,
     paddingVertical: 12,
     borderRadius: 25,
     marginHorizontal: 10,
     marginBottom: 70,
     marginTop: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
   },
   input: {
     flex: 1,
     paddingHorizontal: 10,
     paddingVertical: 6,
     fontSize: 15,
+    color: '#fff',
   },
   sendButton: {
-    backgroundColor: theme.colors.primary,
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
     borderRadius: 50,
     padding: 10,
     alignItems: 'center',
     justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 200, 220, 0.4)',
   },
 });

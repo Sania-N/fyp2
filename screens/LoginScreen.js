@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
+import { Ionicons } from '@expo/vector-icons';
 import theme from '../styles/theme';
 import { loginUser } from "../services/authService";
 
@@ -33,51 +34,162 @@ export default function LoginScreen({ navigation }) {
   };
 
   return (
-    <LinearGradient colors={theme.gradient.background} style={styles.container}>
-      <Text style={styles.title}>Welcome Back </Text>
+    <LinearGradient 
+      colors={['#2d1b2e', '#3d0d3d', '#1a3d4f']} 
+      style={styles.container}
+    >
+      <View style={styles.cardContainer}>
+        {/* Avatar */}
+        <View style={styles.avatarContainer}>
+          <Ionicons name="person-circle" size={80} color="rgba(255,255,255,0.3)" />
+        </View>
 
-      <TextInput
-        style={styles.input}
-        placeholder="Email"
-        value={email}
-        onChangeText={setEmail}
-        keyboardType="email-address"
-        autoCapitalize="none"
-      />
-      <TextInput
-        style={styles.input}
-        placeholder="Password"
-        value={password}
-        secureTextEntry
-        onChangeText={setPassword}
-      />
+        {/* Email Input */}
+        <View style={styles.inputGroup}>
+          <Ionicons name="mail-outline" size={20} color="rgba(255,255,255,0.6)" style={styles.inputIcon} />
+          <TextInput
+            style={styles.input}
+            placeholder="Email ID"
+            placeholderTextColor="rgba(255,255,255,0.5)"
+            value={email}
+            onChangeText={setEmail}
+            keyboardType="email-address"
+            autoCapitalize="none"
+          />
+        </View>
 
-      <TouchableOpacity style={styles.button} onPress={handleLogin} disabled={loading}>
-        <Text style={styles.buttonText}>{loading ? "Logging in..." : "Login"}</Text>
-      </TouchableOpacity>
+        {/* Password Input */}
+        <View style={styles.inputGroup}>
+          <Ionicons name="lock-closed-outline" size={20} color="rgba(255,255,255,0.6)" style={styles.inputIcon} />
+          <TextInput
+            style={styles.input}
+            placeholder="Password"
+            placeholderTextColor="rgba(255,255,255,0.5)"
+            value={password}
+            secureTextEntry
+            onChangeText={setPassword}
+          />
+        </View>
 
-      <TouchableOpacity onPress={() => navigation.navigate('Signup')}>
-        <Text style={styles.link}>Don't have an account? Sign up</Text>
-      </TouchableOpacity>
+        {/* Forgot Password */}
+        <View style={styles.optionsContainer}>
+          <TouchableOpacity onPress={() => Alert.alert("Info", "Password reset feature coming soon!")}>
+            <Text style={styles.forgotText}>Forgot Password?</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Login Button */}
+        <TouchableOpacity 
+          style={styles.loginButton} 
+          onPress={handleLogin} 
+          disabled={loading}
+        >
+          <Text style={styles.loginButtonText}>
+            {loading ? "LOGGING IN..." : "LOGIN"}
+          </Text>
+        </TouchableOpacity>
+
+        {/* Sign Up Link */}
+        <TouchableOpacity onPress={() => navigation.navigate('Signup')}>
+          <Text style={styles.linkText}>
+            Don't have an account? <Text style={styles.linkHighlight}>Sign Up</Text>
+          </Text>
+        </TouchableOpacity>
+      </View>
     </LinearGradient>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: 'center', padding: 25, backgroundColor: '#fff' },
-  title: { fontSize: 28, fontWeight: '700', color: theme.colors.primary, marginBottom: 20 },
+  container: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  cardContainer: {
+    width: '90%',
+    maxWidth: 380,
+    backgroundColor: 'rgba(77, 20, 60, 0.4)',
+    borderRadius: 30,
+    padding: 40,
+    alignItems: 'center',
+    backdropFilter: 'blur(10px)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    shadowColor: 'rgba(0, 0, 0, 0.3)',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.3,
+    shadowRadius: 20,
+    elevation: 10,
+  },
+  avatarContainer: {
+    marginBottom: 30,
+    opacity: 0.8,
+  },
+  inputGroup: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.3)',
+    paddingBottom: 12,
+  },
+  inputIcon: {
+    marginRight: 12,
+  },
   input: {
-    backgroundColor: '#F5F5F5',
-    borderRadius: 10,
-    padding: 15,
-    marginBottom: 15,
+    flex: 1,
+    fontSize: 16,
+    color: '#fff',
+    fontWeight: '500',
   },
-  button: {
-    backgroundColor: theme.colors.primary,
-    padding: 15,
-    borderRadius: 10,
-    marginVertical: 15,
+  optionsContainer: {
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 30,
   },
-  buttonText: { color: '#fff', textAlign: 'center', fontWeight: '600', fontSize: 16 },
-  link: { color: theme.colors.primary, textAlign: 'center', marginTop: 10 },
+  checkboxContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  rememberText: {
+    color: 'rgba(255, 255, 255, 0.7)',
+    marginLeft: 8,
+    fontSize: 14,
+  },
+  forgotText: {
+    color: 'rgba(255, 200, 220, 0.8)',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  loginButton: {
+    width: '100%',
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    paddingVertical: 14,
+    paddingHorizontal: 30,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 200, 220, 0.5)',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  loginButtonText: {
+    color: 'rgba(255, 200, 220, 1)',
+    fontSize: 16,
+    fontWeight: '700',
+    letterSpacing: 1,
+  },
+  linkText: {
+    color: 'rgba(255, 255, 255, 0.7)',
+    textAlign: 'center',
+    fontSize: 14,
+  },
+  linkHighlight: {
+    color: 'rgba(255, 200, 220, 1)',
+    fontWeight: '600',
+  },
 });

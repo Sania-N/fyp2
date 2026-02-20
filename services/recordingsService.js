@@ -15,7 +15,7 @@ import {
   deleteDoc,
   updateDoc,
 } from "firebase/firestore";
-
+import { API_BASE_URL } from "../api";
 // Helper to decode base64 to Uint8Array
 function decode(base64) {
   const binaryString = atob(base64);
@@ -62,47 +62,67 @@ export async function uploadImages(userUid, frontImageUri, backImageUri, timesta
 /* ============================================================
   UPLOAD AUDIO + SAVE FIRESTORE METADATA
 ============================================================ */
-export async function uploadRecording(userUid, localUri, frontImageUri, backImageUri, duration = 0) {
+export async function uploadRecording(
+  userUid,
+  localUri,
+  frontImageUri,
+  backImageUri,
+  duration = 0
+) {
   try {
     const ts = Date.now();
     const filename = `${userUid}_${ts}.m4a`;
     const storagePath = `recordings/${userUid}/${ts}/audio/${filename}`;
 
-    // Read audio file as base64 and upload
     const base64Audio = await FileSystem.readAsStringAsync(localUri, {
       encoding: FileSystem.EncodingType.Base64,
     });
 
-    const { error } = await supabase.storage.from("recordings").upload(storagePath, decode(base64Audio), {
-      contentType: "audio/m4a",
-    });
-    if (error) throw error;
+    await supabase.storage
+      .from("recordings")
+      .upload(storagePath, decode(base64Audio), {
+        contentType: "audio/m4a",
+      });
 
-    const { data: audioData } = supabase.storage.from("recordings").getPublicUrl(storagePath);
-    const audioUrl = audioData?.publicUrl || null;
-    console.log("🎵 Audio uploaded:", audioUrl);
+    const { data } = supabase.storage
+      .from("recordings")
+      .getPublicUrl(storagePath);
 
-    // Upload images
+    const audioUrl = data.publicUrl;
+
     const images = await uploadImages(userUid, frontImageUri, backImageUri, ts);
 
-    // Save metadata in Firestore
+    // 1️⃣ Create Firestore doc first
     const docRef = await addDoc(collection(db, "recordings"), {
       user_uid: userUid,
       filename,
       audio_url: audioUrl,
+      duration,
       front_image_url: images.front_image_url || null,
       back_image_url: images.back_image_url || null,
-      duration,
       created_at: serverTimestamp(),
+      emotion: null,
+      confidence: null,
+      panic: false,
     });
 
-    console.log("🔥 Saved to Firestore Successfully with ID:", docRef.id);
+    // 2️⃣ CALL FASTAPI
+    const result = await detectEmotion(audioUrl);
+
+    // 3️⃣ UPDATE FIRESTORE WITH ML RESULT
+    await updateDoc(doc(db, "recordings", docRef.id), {
+      emotion: result.emotion,
+      confidence: result.confidence,
+      panic: result.panic,
+    });
+
     return audioUrl;
   } catch (err) {
     console.error("uploadRecording failed", err);
     throw err;
   }
 }
+
 
 /* ============================================================
   FETCH + STREAM
@@ -149,4 +169,18 @@ export async function deleteRecording(id, filename, audioURL, frontURL, backURL)
 ============================================================ */
 export async function renameRecording(id, newName) {
   await updateDoc(doc(db, "recordings", id), { filename: newName });
+}
+async function detectEmotion(audioUrl) {
+  const res = await fetch(`${API_BASE_URL}/predict`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audio_url: audioUrl }),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(txt || "Emotion detection failed");
+  }
+
+  return await res.json();
 }

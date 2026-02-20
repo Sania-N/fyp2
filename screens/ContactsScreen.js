@@ -9,7 +9,7 @@ import * as Contacts from 'expo-contacts';
 import { Ionicons } from '@expo/vector-icons';
 import theme from '../styles/theme';
 import { auth } from '../firebase';
-import { saveContact, getUserContacts, deleteContact, updateContact } from '../services/contactService';
+import { saveContact, getUserContacts, deleteContact, updateContact, setPriorityContact } from '../services/contactService';
 
 export default function ContactsScreen() {
   const [phoneContacts, setPhoneContacts] = useState([]);
@@ -21,13 +21,39 @@ export default function ContactsScreen() {
   const [editContactId, setEditContactId] = useState(null);
   const [actionModalVisible, setActionModalVisible] = useState(false);
   const [selectedContact, setSelectedContact] = useState(null);
+  const [permissionGranted, setPermissionGranted] = useState(false);
   const navigation = useNavigation();
 
   const uid = auth.currentUser?.uid;
 
   useEffect(() => {
     loadSavedContacts();
+    checkContactPermission();
   }, []);
+
+  const checkContactPermission = async () => {
+    const { status } = await Contacts.getPermissionsAsync();
+    setPermissionGranted(status === "granted");
+  };
+
+  const requestContactPermission = async () => {
+    try {
+      const { status } = await Contacts.requestPermissionsAsync();
+      setPermissionGranted(status === "granted");
+      
+      if (status === "granted") {
+        Alert.alert("✅ Permission Granted", "You can now import contacts from your phone!");
+      } else {
+        Alert.alert(
+          "⚠️ Permission Denied",
+          "Please enable contact access in your phone settings:\n\nSettings > Apps > SafetyApp > Permissions > Contacts",
+          [{ text: "OK" }]
+        );
+      }
+    } catch (error) {
+      console.error("Permission error:", error);
+    }
+  };
 
   const loadSavedContacts = async () => {
     const contacts = await getUserContacts(uid);
@@ -167,34 +193,55 @@ export default function ContactsScreen() {
   };
 
   return (
-    <LinearGradient colors={theme.gradient.background} style={styles.gradient}>
+    <LinearGradient colors={['#2d1b2e', '#3d0d3d', '#1a3d4f']} style={styles.gradient}>
       <SafeAreaView style={styles.safeArea}>
       <View style={styles.container}>
         <TouchableOpacity
   style={styles.backButton}
   onPress={() => navigation.goBack()}
 >
-  <Ionicons name="arrow-back" size={24} color="#800020" />
+  <Ionicons name="arrow-back" size={24} color="#fff" />
   
 </TouchableOpacity>
 
         <Text style={styles.title}>Trusted Contacts</Text>
 
+        {!permissionGranted && (
+          <TouchableOpacity style={styles.permissionBanner} onPress={requestContactPermission}>
+            <Ionicons name="lock-closed" size={20} color="#ffb3c6" />
+            <View style={{ flex: 1, marginLeft: 12 }}>
+              <Text style={styles.permissionTitle}>Grant Contact Access</Text>
+              <Text style={styles.permissionText}>Enable to import contacts from your phone</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={20} color="#ffb3c6" />
+          </TouchableOpacity>
+        )}
+
         <FlatList
-          data={savedContacts}
+          data={savedContacts.sort((a, b) => (b.isPriority ? 1 : 0) - (a.isPriority ? 1 : 0))}
           keyExtractor={(item) => item.id}
           renderItem={({ item }) => (
-            <View style={styles.contactCard}>
+            <View style={[styles.contactCard, item.isPriority && styles.priorityContactCard]}>
               <View>
-                <Text style={styles.contactName}>{item.name}</Text>
-                <Text style={styles.contactPhone}>{item.phone}</Text>
+                <Text style={[styles.contactName, item.isPriority && { color: '#ffb3c6' }]}>{item.name}</Text>
+                <Text style={[styles.contactPhone, item.isPriority && { color: '#ffb3c6' }]}>{item.phone}</Text>
+                {item.isPriority && (
+                  <Text style={{
+                    color: "#ffb3c6",
+                    fontSize: 12,
+                    fontWeight: "700",
+                    marginTop: 4
+                  }}>
+                    ★ Emergency Contact
+                  </Text>
+                )}
               </View>
               <TouchableOpacity onPress={() => openActionMenu(item)}>
-                <Ionicons name="ellipsis-vertical" size={24} color="#800020" />
+                <Ionicons name="ellipsis-vertical" size={24} color={item.isPriority ? "#ffb3c6" : "#800020"} />
               </TouchableOpacity>
             </View>
           )}
-          ListEmptyComponent={<Text>No saved contacts yet.</Text>}
+          ListEmptyComponent={<Text style={{ color: 'rgba(255, 255, 255, 0.6)', textAlign: 'center', marginTop: 40, fontSize: 16 }}>No saved contacts yet.</Text>}
         />
 
         <TouchableOpacity style={styles.addButton} onPress={() => Alert.alert(
@@ -270,6 +317,17 @@ export default function ContactsScreen() {
       <Modal visible={actionModalVisible} transparent animationType="fade">
         <View style={styles.actionOverlay}>
           <View style={styles.actionModal}>
+            <TouchableOpacity
+              style={styles.actionBtn}
+              onPress={async () => {
+                await setPriorityContact(uid, selectedContact.id);
+                loadSavedContacts();
+                setActionModalVisible(false);
+                Alert.alert("Priority Set", `${selectedContact.name} is now your emergency contact`);
+              }}
+            >
+              <Text style={styles.actionText}>Set as Emergency Contact</Text>
+            </TouchableOpacity>
             <TouchableOpacity style={styles.actionBtn} onPress={handleEdit}>
               <Text style={styles.actionText}>Edit</Text>
             </TouchableOpacity>
@@ -290,24 +348,28 @@ export default function ContactsScreen() {
 const styles = StyleSheet.create({
   gradient: { flex: 1 },
   safeArea: { flex: 1, backgroundColor: "transparent" },
-  container: { padding: 20 },
-  title: { fontSize: 22, fontWeight: "700", marginBottom: 10, color: "#800020" },
+  container: { padding: 20, paddingBottom: 110 },
+  title: { fontSize: 28, fontWeight: "700", marginBottom: 16, color: "#fff" },
   backButton: { marginBottom: 15 },
-  contactCard: { flexDirection: "row", justifyContent: "space-between", backgroundColor: "#FDF5F7", borderLeftWidth: 4, borderLeftColor: "#800020", padding: 12, borderRadius: 10, marginVertical: 5 },
-  contactName: { fontSize: 16, fontWeight: "600", color: "#333" },
-  contactPhone: { color: "#666" },
-  addButton: { flexDirection: "row", backgroundColor: "#800020", padding: 12, borderRadius: 10, marginTop: 15, justifyContent: "center" },
-  addText: { color: "#fff", fontWeight: "700", marginLeft: 5 },
-  phoneItem: { padding: 15, borderBottomWidth: 1, borderColor: "#E8D5D9" },
-  phoneName: { fontSize: 16, fontWeight: "600", color: "#333" },
-  phoneNumber: { color: "#666" },
-  closeBtn: { backgroundColor: "#800020", padding: 15, alignItems: "center", margin: 10, borderRadius: 8 },
-  manualModal: { flex: 1, justifyContent: "center", padding: 20, backgroundColor: "#fff" },
-  modalTitle: { fontSize: 20, fontWeight: "700", marginBottom: 20, textAlign: "center", color: "#800020" },
-  input: { borderWidth: 1, borderColor: "#E8D5D9", borderRadius: 8, padding: 12, marginBottom: 15, backgroundColor: "#FDF5F7" },
-  saveBtn: { backgroundColor: "#800020", padding: 15, alignItems: "center", borderRadius: 8, marginBottom: 10 },
-  actionOverlay: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "rgba(0,0,0,0.5)" },
-  actionModal: { width: 250, backgroundColor: "#fff", borderRadius: 10, padding: 20 },
-  actionBtn: { padding: 15, alignItems: "center", marginVertical: 5, borderRadius: 8, backgroundColor: "#F9E8EB" },
-  actionText: { fontSize: 16, fontWeight: "600", color: "#333" },
+  contactCard: { flexDirection: "row", justifyContent: "space-between", backgroundColor: "rgba(77, 20, 60, 0.4)", borderLeftWidth: 3, borderLeftColor: "rgba(255, 200, 220, 0.8)", padding: 16, borderRadius: 12, marginVertical: 8, borderWidth: 1, borderColor: "rgba(255, 255, 255, 0.1)" },
+  priorityContactCard: { backgroundColor: "rgba(255, 200, 220, 0.15)", borderLeftColor: "#ffb3c6", borderLeftWidth: 4, borderColor: "rgba(255, 200, 220, 0.4)" },
+  contactName: { fontSize: 16, fontWeight: "600", color: "#fff" },
+  contactPhone: { color: "rgba(255, 255, 255, 0.6)", marginTop: 4 },
+  permissionBanner: { flexDirection: "row", alignItems: "center", backgroundColor: "rgba(255, 200, 220, 0.15)", borderWidth: 1.5, borderColor: "rgba(255, 200, 220, 0.4)", borderRadius: 12, padding: 16, marginBottom: 16 },
+  permissionTitle: { fontSize: 14, fontWeight: "700", color: "#ffb3c6" },
+  permissionText: { fontSize: 12, color: "rgba(255, 200, 220, 0.8)", marginTop: 2 },
+  addButton: { flexDirection: "row", backgroundColor: "rgba(255, 255, 255, 0.1)", padding: 14, borderRadius: 12, marginTop: 20, justifyContent: "center", borderWidth: 1.5, borderColor: "rgba(255, 200, 220, 0.5)" },
+  addText: { color: "rgba(255, 200, 220, 1)", fontWeight: "700", marginLeft: 8 },
+  phoneItem: { padding: 15, borderBottomWidth: 1, borderColor: "rgba(255, 255, 255, 0.1)", backgroundColor: "rgba(77, 20, 60, 0.3)" },
+  phoneName: { fontSize: 16, fontWeight: "600", color: "#fff" },
+  phoneNumber: { color: "rgba(255, 255, 255, 0.6)", marginTop: 4 },
+  closeBtn: { backgroundColor: "rgba(255, 200, 220, 0.15)", padding: 15, alignItems: "center", margin: 10, borderRadius: 12, borderWidth: 1, borderColor: "rgba(255, 200, 220, 0.3)" },
+  manualModal: { flex: 1, justifyContent: "center", padding: 20, backgroundColor: "#2d1b2e" },
+  modalTitle: { fontSize: 20, fontWeight: "700", marginBottom: 20, textAlign: "center", color: "#fff" },
+  input: { borderWidth: 1, borderColor: "rgba(255, 200, 220, 0.3)", borderRadius: 10, padding: 14, marginBottom: 15, backgroundColor: "rgba(255, 255, 255, 0.08)", color: "#fff", placeholderTextColor: "rgba(255, 255, 255, 0.4)" },
+  saveBtn: { backgroundColor: "rgba(255, 255, 255, 0.1)", padding: 15, alignItems: "center", borderRadius: 10, marginBottom: 10, borderWidth: 1, borderColor: "rgba(255, 200, 220, 0.5)" },
+  actionOverlay: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "rgba(0,0,0,0.6)" },
+  actionModal: { width: 250, backgroundColor: "#2d1b2e", borderRadius: 15, padding: 20, borderWidth: 1, borderColor: "rgba(255, 200, 220, 0.2)" },
+  actionBtn: { padding: 15, alignItems: "center", marginVertical: 8, borderRadius: 10, backgroundColor: "rgba(255, 255, 255, 0.1)", borderWidth: 1, borderColor: "rgba(255, 200, 220, 0.3)" },
+  actionText: { fontSize: 16, fontWeight: "600", color: "rgba(255, 200, 220, 1)" },
 });

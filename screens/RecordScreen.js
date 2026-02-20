@@ -8,10 +8,12 @@ import {
   ActivityIndicator,
   Alert,
 } from "react-native";
+import { LinearGradient } from "expo-linear-gradient";
 import { Audio } from "expo-av";
 import { CameraView } from "expo-camera";
 import * as FileSystem from "expo-file-system/legacy";
 import Header from "../components/Header";
+import ChatFAB from "../components/ChatFAB";
 import theme from "../styles/theme";
 import { useNavigation } from "@react-navigation/native";
 import { useAuth } from "../useAuth";
@@ -199,74 +201,80 @@ export default function RecordScreen() {
   const wait = (ms) => new Promise((res) => setTimeout(res, ms));
 
   return (
-    <View style={styles.container}>
-      <Header />
+    <LinearGradient 
+      colors={['#2d1b2e', '#3d0d3d', '#1a3d4f']} 
+      style={{ flex: 1 }}
+    >
+      <View style={styles.container}>
+        <Header />
 
-      {/* Hidden Camera for silent capture */}
-      {hasCameraPermission && (
-        <View style={styles.hiddenCameraContainer} pointerEvents="none">
-          <CameraView
-            ref={cameraRef}
-            style={styles.hiddenCamera}
-            facing={cameraType}  // ⭐ SDK 54 CORRECT PROP
-          />
-        </View>
-      )}
-
-      <TouchableOpacity
-        style={styles.historyCard}
-        onPress={() =>
-          navigation.navigate("RecordingsHistory", { userUid: user.uid })
-        }
-      >
-        <Text style={styles.historyTitle}>Saved Recordings</Text>
-        <Text style={styles.historySubtitle}>Tap to view</Text>
-      </TouchableOpacity>
-
-      <View style={styles.centerArea}>
-        {isRecording && (
-          <View style={styles.timerContainer}>
-            <View
-              style={[
-                styles.recordingIndicator,
-                animatePulse && styles.recordingIndicatorActive,
-              ]}
+        {/* Hidden Camera for silent capture */}
+        {hasCameraPermission && (
+          <View style={styles.hiddenCameraContainer} pointerEvents="none">
+            <CameraView
+              ref={cameraRef}
+              style={styles.hiddenCamera}
+              facing={cameraType}  // ⭐ SDK 54 CORRECT PROP
             />
-            <Text style={styles.timerText}>{formatTime(recordingTime)}</Text>
           </View>
         )}
 
         <TouchableOpacity
-          style={[
-            styles.recordButton,
-            isRecording && { backgroundColor: theme.colors.danger },
-          ]}
-          onPress={toggleRecording}
-          disabled={uploading}
+          style={styles.historyCard}
+          onPress={() =>
+            navigation.navigate("RecordingsHistory", { userUid: user.uid })
+          }
         >
-          <Text style={styles.recordText}>
-            {uploading
-              ? "Uploading..."
-              : isRecording
-              ? "Stop Recording"
-              : "Start Recording"}
-          </Text>
+          <Text style={styles.historyTitle}>Saved Recordings</Text>
+          <Text style={styles.historySubtitle}>Tap to view</Text>
         </TouchableOpacity>
 
-        {uploading && (
-          <ActivityIndicator
-            style={{ marginTop: 20 }}
-            color={theme.colors.primary}
-          />
-        )}
+        <View style={styles.centerArea}>
+          {isRecording && (
+            <View style={styles.timerContainer}>
+              <View
+                style={[
+                  styles.recordingIndicator,
+                  animatePulse && styles.recordingIndicatorActive,
+                ]}
+              />
+              <Text style={styles.timerText}>{formatTime(recordingTime)}</Text>
+            </View>
+          )}
+
+          <TouchableOpacity
+            style={[
+              styles.recordButton,
+              isRecording && { backgroundColor: theme.colors.danger },
+            ]}
+            onPress={toggleRecording}
+            disabled={uploading}
+          >
+            <Text style={styles.recordText}>
+              {uploading
+                ? "Uploading..."
+                : isRecording
+                ? "Stop Recording"
+                : "Start Recording"}
+            </Text>
+          </TouchableOpacity>
+
+          {uploading && (
+            <ActivityIndicator
+              style={{ marginTop: 20 }}
+              color="#fff"
+            />
+          )}
+        </View>
+        <ChatFAB />
       </View>
-    </View>
+    </LinearGradient>
   );
 }
 
 // ---------------- STYLES ----------------
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#fff" },
+  container: { flex: 1, paddingBottom: 90 },
 
   hiddenCameraContainer: {
     position: "absolute",
@@ -283,16 +291,18 @@ const styles = StyleSheet.create({
   },
 
   historyCard: {
-    backgroundColor: "#F3F3F3",
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
     padding: 20,
     borderRadius: 15,
     width: "90%",
     alignSelf: "center",
     marginTop: 20,
     marginBottom: 20,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.2)",
   },
-  historyTitle: { fontSize: 18, fontWeight: "600" },
-  historySubtitle: { color: "gray" },
+  historyTitle: { fontSize: 18, fontWeight: "600", color: "#fff" },
+  historySubtitle: { color: "rgba(255, 255, 255, 0.6)" },
 
   centerArea: {
     flex: 1,
@@ -304,17 +314,19 @@ const styles = StyleSheet.create({
   timerContainer: {
     alignItems: "center",
     marginBottom: 50,
-    backgroundColor: "#FEF0F0",
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
     paddingVertical: 25,
     paddingHorizontal: 40,
     borderRadius: 15,
     width: "85%",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.2)",
   },
   recordingIndicator: {
     width: 14,
     height: 14,
     borderRadius: 7,
-    backgroundColor: theme.colors.danger,
+    backgroundColor: "rgba(255, 100, 130, 1)",
     marginBottom: 12,
   },
   recordingIndicatorActive: {
@@ -323,20 +335,22 @@ const styles = StyleSheet.create({
   timerText: {
     fontSize: 36,
     fontWeight: "bold",
-    color: theme.colors.danger,
+    color: "rgba(255, 200, 220, 1)",
     letterSpacing: 2,
   },
 
   recordButton: {
-    backgroundColor: theme.colors.primary,
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
     paddingVertical: 22,
     paddingHorizontal: 60,
     borderRadius: 15,
     minWidth: 250,
     alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255, 200, 220, 0.5)",
   },
   recordText: {
-    color: "#fff",
+    color: "rgba(255, 200, 220, 1)",
     fontSize: 18,
     fontWeight: "700",
   },
