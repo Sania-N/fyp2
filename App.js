@@ -18,6 +18,8 @@ import RecordScreen from './screens/RecordScreen';
 import SosScreen from './screens/SosScreen';
 import ChatbotScreen from './screens/ChatbotScreen';
 import RoutesScreen from './screens/RoutesScreen';
+import SearchLocationsScreen from './screens/SearchLocationsScreen';
+import LocationDetailScreen from './screens/LocationDetailScreen';
 import MenuScreen from './screens/MenuScreen';
 import ProfileScreen from './screens/ProfileScreen';
 import RecordingsHistoryScreen from './screens/RecordingsHistoryScreen';
@@ -101,6 +103,8 @@ export default function App() {
         {user ? (
           <>
             <Stack.Screen name="MainTabs" component={MainTabs} />
+            <Stack.Screen name="SearchLocations" component={SearchLocationsScreen} />
+            <Stack.Screen name="LocationDetail" component={LocationDetailScreen} />
             <Stack.Screen name="ChatbotScreen" component={ChatbotScreen} options={{ presentation: 'modal' }} />
             <Stack.Screen name="MenuScreen" component={MenuScreen} />
             <Stack.Screen name="ProfileScreen" component={ProfileScreen} />
