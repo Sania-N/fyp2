@@ -12,10 +12,11 @@ import {
   Alert,
 } from 'react-native';
 
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapView, { Marker, Polyline, Circle, PROVIDER_GOOGLE } from 'react-native-maps';
 import * as Location from 'expo-location';
 import { MaterialIcons } from '@expo/vector-icons';
 import theme from '../styles/theme';
+import { getRouteSafety } from '../services/routeSafetyService';
 
 const { width, height } = Dimensions.get('window');
 const COLLAPSED_HEIGHT = height * 0.3; // 30% of screen height
@@ -72,6 +73,127 @@ const TRAVEL_MODE_CONFIG = {
   },
 };
 
+const SAFETY_SAMPLE_INTERVAL = 5;
+const MAP_SAFETY_CIRCLE_INTERVAL = 15;
+
+const getSafetyColor = (score) => {
+  if (typeof score !== 'number') return theme.colors.primary;
+  if (score > 70) return 'green';
+  if (score >= 40) return 'orange';
+  return 'red';
+};
+
+const getRouteChipPalette = (score, isSelected) => {
+  if (typeof score !== 'number') {
+    return isSelected
+      ? {
+          backgroundColor: theme.colors.primary,
+          borderColor: theme.colors.primary,
+          labelColor: '#FFF',
+          metaColor: 'rgba(255, 255, 255, 0.9)',
+        }
+      : {
+          backgroundColor: 'rgba(255, 255, 255, 0.9)',
+          borderColor: 'rgba(0, 0, 0, 0.08)',
+          labelColor: theme.colors.text,
+          metaColor: '#666',
+        };
+  }
+
+  if (score > 70) {
+    return isSelected
+      ? {
+          backgroundColor: '#2FAD65',
+          borderColor: '#2FAD65',
+          labelColor: '#FFF',
+          metaColor: 'rgba(255, 255, 255, 0.9)',
+        }
+      : {
+          backgroundColor: '#E8F6EE',
+          borderColor: '#2FAD65',
+          labelColor: '#1F8A4D',
+          metaColor: '#2F7D52',
+        };
+  }
+
+  if (score >= 40) {
+    return isSelected
+      ? {
+          backgroundColor: '#F39C12',
+          borderColor: '#F39C12',
+          labelColor: '#FFF',
+          metaColor: 'rgba(255, 255, 255, 0.9)',
+        }
+      : {
+          backgroundColor: '#FFF3E0',
+          borderColor: '#F39C12',
+          labelColor: '#A15B00',
+          metaColor: '#B26A0A',
+        };
+  }
+
+  return isSelected
+    ? {
+        backgroundColor: '#E74C3C',
+        borderColor: '#E74C3C',
+        labelColor: '#FFF',
+        metaColor: 'rgba(255, 255, 255, 0.9)',
+      }
+    : {
+        backgroundColor: '#FDEDEC',
+        borderColor: '#E74C3C',
+        labelColor: '#A93226',
+        metaColor: '#B03A2E',
+      };
+};
+
+const sampleCoordinatesForSafety = (coordinates = [], interval = SAFETY_SAMPLE_INTERVAL) => {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) {
+    return [];
+  }
+
+  const sampled = coordinates.filter((_, index) => index % interval === 0);
+  const lastCoordinate = coordinates[coordinates.length - 1];
+  const alreadyHasLast = sampled[sampled.length - 1] === lastCoordinate;
+
+  if (!alreadyHasLast) {
+    sampled.push(lastCoordinate);
+  }
+
+  return sampled;
+};
+
+const getSafetyCircleStyle = (score) => {
+  if (typeof score !== 'number') {
+    return {
+      strokeColor: 'rgba(128, 0, 32, 0.7)',
+      fillColor: 'rgba(128, 0, 32, 0.18)',
+    };
+  }
+
+  if (score > 70) {
+    return {
+      strokeColor: 'rgba(47, 173, 101, 0.95)',
+      fillColor: 'rgba(47, 173, 101, 0.28)',
+    };
+  }
+
+  if (score >= 40) {
+    return {
+      strokeColor: 'rgba(234, 179, 8, 0.95)',
+      fillColor: 'rgba(234, 179, 8, 0.28)',
+    };
+  }
+
+  return {
+    strokeColor: 'rgba(220, 38, 38, 0.95)',
+    fillColor: 'rgba(220, 38, 38, 0.28)',
+  };
+};
+
+const sampleCoordinatesForMapCircles = (coordinates = []) =>
+  sampleCoordinatesForSafety(coordinates, MAP_SAFETY_CIRCLE_INTERVAL);
+
 const LocationDetailScreen = ({ navigation, route }) => {
   const initialDestination = route?.params?.location ?? null;
   const [userLocation, setUserLocation] = useState(null);
@@ -81,6 +203,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
   const [routeAlternatives, setRouteAlternatives] = useState([]);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
   const [routeInfo, setRouteInfo] = useState(null);
+  const [isSafetyLoading, setIsSafetyLoading] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isNavigating, setIsNavigating] = useState(false);
   const [selectedTravelMode, setSelectedTravelMode] = useState('drive');
@@ -122,6 +245,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
       }),
       trafficStatus: modeConfig.trafficStatus,
       fuelSaving: modeConfig.fuelSaving,
+      safetyScore: route?.safetyScore ?? null,
     };
   };
 
@@ -336,29 +460,128 @@ const LocationDetailScreen = ({ navigation, route }) => {
 
   try {
     const response = await fetch(
-      `https://router.project-osrm.org/route/v1/${modeConfig.osrmProfile}/${start};${end}?alternatives=true&geometries=geojson&overview=full`
+      `https://router.project-osrm.org/route/v1/${modeConfig.osrmProfile}/${start};${end}?alternatives=true&geometries=geojson&overview=full&steps=true&annotations=true`
     );
     const data = await response.json();
 
     if (data.routes && data.routes.length > 0) {
       const alternatives = data.routes
-        .map((routeItem, index) => ({
-          id: `route-${index}`,
-          coordinates: (routeItem.geometry?.coordinates || []).map((coord) => ({
-            latitude: coord[1],
-            longitude: coord[0],
-          })),
-          distance: routeItem.distance,
-          duration: routeItem.duration,
-          label: index === 0 ? 'Fastest' : `Alternative ${index}`,
-        }))
+        .map((routeItem, index) => {
+          const segments = (routeItem.legs || []).flatMap((leg, legIndex) =>
+            (leg.steps || []).map((step, stepIndex) => {
+              const rawStreetName =
+                typeof step.name === 'string' && step.name.trim().length > 0 ? step.name.trim() : null;
+              const fallbackStreetName = [step.ref, step.destinations, step.rotary_name]
+                .find((value) => typeof value === 'string' && value.trim().length > 0)
+                ?.trim() || null;
+              const stepCoords = Array.isArray(step.geometry?.coordinates)
+                ? step.geometry.coordinates
+                : [];
+              const maneuverLocation = Array.isArray(step.maneuver?.location)
+                ? {
+                    latitude: step.maneuver.location[1],
+                    longitude: step.maneuver.location[0],
+                  }
+                : null;
+
+              return {
+                id: `segment-${index}-${legIndex}-${stepIndex}`,
+                legIndex,
+                stepIndex,
+                streetName: rawStreetName || fallbackStreetName,
+                hasStreetName: Boolean(rawStreetName || fallbackStreetName),
+                distance: step.distance ?? 0,
+                duration: step.duration ?? 0,
+                mode: step.mode || null,
+                ref: step.ref || null,
+                drivingSide: step.driving_side || null,
+                maneuverType: step.maneuver?.type || null,
+                maneuverModifier: step.maneuver?.modifier || null,
+                maneuverLocation,
+                coordinates: stepCoords.map((coord) => ({
+                  latitude: coord[1],
+                  longitude: coord[0],
+                })),
+              };
+            })
+          );
+
+          return {
+            id: `route-${index}`,
+            routeId: index + 1,
+            coordinates: (routeItem.geometry?.coordinates || []).map((coord) => ({
+              latitude: coord[1],
+              longitude: coord[0],
+            })),
+            distance: routeItem.distance,
+            duration: routeItem.duration,
+            safetyScore: null,
+            color: theme.colors.primary,
+            segments,
+            streetNames: Array.from(
+              new Set(
+                segments
+                  .map((segment) => segment.streetName)
+                  .filter((name) => typeof name === 'string' && name.trim().length > 0)
+              )
+            ),
+            label: index === 0 ? 'Fastest' : `Alternative ${index}`,
+          };
+        })
         .filter((routeItem) => routeItem.coordinates.length > 0)
         .sort((a, b) => a.duration - b.duration);
 
-      setRouteAlternatives(alternatives);
+      const alternativesWithRouteIds = alternatives.map((routeItem, index) => ({
+        ...routeItem,
+        routeId: index + 1,
+      }));
 
-      if (alternatives.length > 0) {
-        applySelectedRoute(alternatives, 0, modeKey);
+      let routesWithSafety = alternativesWithRouteIds;
+
+      try {
+        setIsSafetyLoading(true);
+        const safetyPayloadRoutes = alternativesWithRouteIds.map((routeItem) => ({
+          route_id: routeItem.routeId,
+          coordinates: sampleCoordinatesForSafety(routeItem.coordinates).map((point) => ({
+            lat: point.latitude,
+            lng: point.longitude,
+          })),
+        }));
+        const safetyPayload = {
+          origin_lat: fromCoords.latitude,
+          origin_lng: fromCoords.longitude,
+          destination_lat: destination.latitude,
+          destination_lng: destination.longitude,
+          timestamp: new Date().toISOString(),
+          routes: safetyPayloadRoutes,
+        };
+
+        const safetyResults = await getRouteSafety(safetyPayload);
+        const safetyByRouteId = new Map(
+          (Array.isArray(safetyResults) ? safetyResults : []).map((item) => [
+            Number(item.route_id),
+            Number(item.safety_score),
+          ])
+        );
+
+        routesWithSafety = alternativesWithRouteIds.map((routeItem) => {
+          const safetyScore = safetyByRouteId.get(routeItem.routeId);
+          return {
+            ...routeItem,
+            safetyScore: Number.isFinite(safetyScore) ? safetyScore : null,
+            color: getSafetyColor(safetyScore),
+          };
+        });
+      } catch (safetyError) {
+        console.error('Error getting route safety:', safetyError);
+      } finally {
+        setIsSafetyLoading(false);
+      }
+
+      setRouteAlternatives(routesWithSafety);
+
+      if (routesWithSafety.length > 0) {
+        applySelectedRoute(routesWithSafety, 0, modeKey);
       }
     }
   } catch (error) {
@@ -404,6 +627,35 @@ const LocationDetailScreen = ({ navigation, route }) => {
   const handleAlternativeSelect = (index) => {
     if (!routeAlternatives.length) return;
     applySelectedRoute(routeAlternatives, index, selectedTravelMode);
+  };
+
+  const handleDebugRouteData = () => {
+    const selectedRoute = routeAlternatives[selectedRouteIndex] || null;
+    if (!selectedRoute) {
+      Alert.alert('Debug Route Data', 'No selected route available yet.');
+      return;
+    }
+
+    const segments = Array.isArray(selectedRoute.segments) ? selectedRoute.segments : [];
+    const firstStreetNames = segments
+      .map((segment) => segment.streetName)
+      .filter((name) => typeof name === 'string' && name.trim().length > 0)
+      .slice(0, 5);
+
+    console.log('Selected Route Debug', {
+      routeId: selectedRoute.id,
+      label: selectedRoute.label,
+      distance: selectedRoute.distance,
+      duration: selectedRoute.duration,
+      segmentCount: segments.length,
+      streetNamesPreview: firstStreetNames,
+      segmentsPreview: segments.slice(0, 3),
+    });
+
+    Alert.alert(
+      'Route Debug',
+      `Segments: ${segments.length}\nStreets: ${firstStreetNames.join(', ') || 'N/A'}`
+    );
   };
 
   const orderedRouteAlternatives = routeAlternatives
@@ -509,6 +761,22 @@ const LocationDetailScreen = ({ navigation, route }) => {
               onPress={() => handleAlternativeSelect(index)}
             />
           ))}
+
+          {routeAlternatives.map((routeItem) => {
+            const circleStyle = getSafetyCircleStyle(routeItem.safetyScore);
+            const sampledCirclePoints = sampleCoordinatesForMapCircles(routeItem.coordinates);
+
+            return sampledCirclePoints.map((point, pointIndex) => (
+              <Circle
+                key={`detail-route-safety-circle-${routeItem.id}-${pointIndex}`}
+                center={point}
+                radius={50}
+                strokeColor={circleStyle.strokeColor}
+                fillColor={circleStyle.fillColor}
+                strokeWidth={1}
+              />
+            ));
+          })}
         </MapView>
       ) : (
         <View style={styles.loadingContainer} />
@@ -589,6 +857,9 @@ const LocationDetailScreen = ({ navigation, route }) => {
             </View>
 
             <View style={styles.routeCard}>
+              {isSafetyLoading && (
+                <Text style={styles.safetyLoadingText}>Analyzing route safety...</Text>
+              )}
               <View style={styles.routeBadgeRow}>
                 <View style={[styles.modePill, styles.modePillActive]}>
                   <MaterialIcons
@@ -611,6 +882,9 @@ const LocationDetailScreen = ({ navigation, route }) => {
               <Text style={styles.routeSubtext}>
                 {routeInfo ? routeInfo.trafficStatus : 'Looking up traffic...'}
               </Text>
+              {routeInfo?.safetyScore !== null && routeInfo?.safetyScore !== undefined && (
+                <Text style={styles.routeSafetyText}>Safety score: {routeInfo.safetyScore}</Text>
+              )}
 
               {routeAlternatives.length > 1 && (
                 <ScrollView
@@ -624,14 +898,29 @@ const LocationDetailScreen = ({ navigation, route }) => {
                       key={routeItem.id}
                       style={[
                         styles.routeChip,
-                        index === selectedRouteIndex && styles.routeChipActive,
+                        {
+                          backgroundColor: getRouteChipPalette(
+                            routeItem.safetyScore,
+                            index === selectedRouteIndex
+                          ).backgroundColor,
+                          borderColor: getRouteChipPalette(
+                            routeItem.safetyScore,
+                            index === selectedRouteIndex
+                          ).borderColor,
+                          borderWidth: index === selectedRouteIndex ? 2 : 1,
+                        },
                       ]}
                       onPress={() => handleAlternativeSelect(index)}
                     >
                       <Text
                         style={[
                           styles.routeChipLabel,
-                          index === selectedRouteIndex && styles.routeChipLabelActive,
+                          {
+                            color: getRouteChipPalette(
+                              routeItem.safetyScore,
+                              index === selectedRouteIndex
+                            ).labelColor,
+                          },
                         ]}
                       >
                         {routeItem.label}
@@ -639,7 +928,12 @@ const LocationDetailScreen = ({ navigation, route }) => {
                       <Text
                         style={[
                           styles.routeChipMeta,
-                          index === selectedRouteIndex && styles.routeChipMetaActive,
+                          {
+                            color: getRouteChipPalette(
+                              routeItem.safetyScore,
+                              index === selectedRouteIndex
+                            ).metaColor,
+                          },
                         ]}
                       >
                         {`${Math.max(1, Math.round(routeItem.duration / 60))} min • ${(routeItem.distance / 1000).toFixed(1)} km`}
@@ -672,6 +966,12 @@ const LocationDetailScreen = ({ navigation, route }) => {
                   onPress={isNavigating ? handleStopNavigation : handleStartNavigation}
                 >
                   <Text style={styles.routeActionTextPrimary}>{isNavigating ? 'Stop' : 'Start'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.routeActionButton, styles.routeActionSecondary]}
+                  onPress={handleDebugRouteData}
+                >
+                  <Text style={styles.routeActionTextSecondary}>Debug Route Data</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -874,6 +1174,18 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#6A6A6A',
     marginBottom: 14,
+  },
+  safetyLoadingText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: theme.colors.text,
+    marginBottom: 10,
+  },
+  routeSafetyText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: theme.colors.text,
+    marginBottom: 12,
   },
   routeAlternativesScroll: {
     marginBottom: 14,

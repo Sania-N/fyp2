@@ -9,11 +9,144 @@ import {
   SafeAreaView,
   Alert,
 } from 'react-native';
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapView, { Marker, Polyline, Circle, PROVIDER_GOOGLE } from 'react-native-maps';
 import * as Location from 'expo-location';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { MaterialIcons } from '@expo/vector-icons';
 import theme from '../styles/theme';
+import { getRouteSafety } from '../services/routeSafetyService';
+
+const ROUTES_STORAGE_KEY = '@routes_last_snapshot';
+const SAFETY_SAMPLE_INTERVAL = 5;
+const MAP_SAFETY_CIRCLE_INTERVAL = 15;
+
+const getSafetyColor = (score) => {
+  if (typeof score !== 'number') return theme.colors.primary;
+  if (score > 70) return 'green';
+  if (score >= 40) return 'orange';
+  return 'red';
+};
+
+const getRouteChipPalette = (score, isSelected) => {
+  if (typeof score !== 'number') {
+    return isSelected
+      ? {
+          backgroundColor: theme.colors.primary,
+          borderColor: theme.colors.primary,
+          labelColor: '#FFF',
+          metaColor: 'rgba(255, 255, 255, 0.9)',
+        }
+      : {
+          backgroundColor: 'rgba(255, 255, 255, 0.9)',
+          borderColor: 'rgba(0, 0, 0, 0.08)',
+          labelColor: theme.colors.text,
+          metaColor: '#666',
+        };
+  }
+
+  if (score > 70) {
+    return isSelected
+      ? {
+          backgroundColor: '#2FAD65',
+          borderColor: '#2FAD65',
+          labelColor: '#FFF',
+          metaColor: 'rgba(255, 255, 255, 0.9)',
+        }
+      : {
+          backgroundColor: '#E8F6EE',
+          borderColor: '#2FAD65',
+          labelColor: '#1F8A4D',
+          metaColor: '#2F7D52',
+        };
+  }
+
+  if (score >= 40) {
+    return isSelected
+      ? {
+          backgroundColor: '#F39C12',
+          borderColor: '#F39C12',
+          labelColor: '#FFF',
+          metaColor: 'rgba(255, 255, 255, 0.9)',
+        }
+      : {
+          backgroundColor: '#FFF3E0',
+          borderColor: '#F39C12',
+          labelColor: '#A15B00',
+          metaColor: '#B26A0A',
+        };
+  }
+
+  return isSelected
+    ? {
+        backgroundColor: '#E74C3C',
+        borderColor: '#E74C3C',
+        labelColor: '#FFF',
+        metaColor: 'rgba(255, 255, 255, 0.9)',
+      }
+    : {
+        backgroundColor: '#FDEDEC',
+        borderColor: '#E74C3C',
+        labelColor: '#A93226',
+        metaColor: '#B03A2E',
+      };
+};
+
+const sampleCoordinatesForSafety = (coordinates = [], interval = SAFETY_SAMPLE_INTERVAL) => {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) {
+    return [];
+  }
+
+  const sampled = coordinates.filter((_, index) => index % interval === 0);
+  const lastCoordinate = coordinates[coordinates.length - 1];
+  const alreadyHasLast = sampled[sampled.length - 1] === lastCoordinate;
+
+  if (!alreadyHasLast) {
+    sampled.push(lastCoordinate);
+  }
+
+  return sampled;
+};
+
+const getSafetyCircleStyle = (score) => {
+  if (typeof score !== 'number') {
+    return {
+      strokeColor: 'rgba(128, 0, 32, 0.7)',
+      fillColor: 'rgba(128, 0, 32, 0.18)',
+    };
+  }
+
+  if (score > 70) {
+    return {
+      strokeColor: 'rgba(47, 173, 101, 0.95)',
+      fillColor: 'rgba(47, 173, 101, 0.28)',
+    };
+  }
+
+  if (score >= 40) {
+    return {
+      strokeColor: 'rgba(234, 179, 8, 0.95)',
+      fillColor: 'rgba(234, 179, 8, 0.28)',
+    };
+  }
+
+  return {
+    strokeColor: 'rgba(220, 38, 38, 0.95)',
+    fillColor: 'rgba(220, 38, 38, 0.28)',
+  };
+};
+
+const sampleCoordinatesForMapCircles = (coordinates = []) =>
+  sampleCoordinatesForSafety(coordinates, MAP_SAFETY_CIRCLE_INTERVAL);
+
+const buildSafetyPayloadRoutes = (routes = []) =>
+  routes.map((route, index) => ({
+    route_id: Number(route.id) || index + 1,
+    coordinates: sampleCoordinatesForSafety(route.coordinates).map((point) => ({
+      lat: point.latitude,
+      lng: point.longitude,
+    })),
+  }));
 
 const RoutesScreen = ({ navigation, route }) => {
   const mapRef = useRef(null);
@@ -22,7 +155,61 @@ const RoutesScreen = ({ navigation, route }) => {
   const [routesData, setRoutesData] = useState([]);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [isSafetyLoading, setIsSafetyLoading] = useState(false);
   const [mapLoading, setMapLoading] = useState(true);
+
+  const clearStoredRouteSnapshot = async () => {
+    try {
+      await AsyncStorage.removeItem(ROUTES_STORAGE_KEY);
+    } catch (error) {
+      console.warn('Failed to clear stored route snapshot', error);
+    }
+  };
+
+  const persistRouteSnapshot = async ({ location, routes, selectedIndex, origin }) => {
+    if (!location || !Array.isArray(routes) || routes.length === 0) return;
+
+    const payload = {
+      savedAt: Date.now(),
+      selectedLocation: location,
+      routesData: routes,
+      selectedRouteIndex: selectedIndex,
+      userLocation: origin || null,
+    };
+
+    try {
+      await AsyncStorage.setItem(ROUTES_STORAGE_KEY, JSON.stringify(payload));
+    } catch (error) {
+      console.warn('Failed to persist route snapshot', error);
+    }
+  };
+
+  useEffect(() => {
+    const loadStoredRouteSnapshot = async () => {
+      try {
+        const stored = await AsyncStorage.getItem(ROUTES_STORAGE_KEY);
+        if (!stored) return;
+
+        const parsed = JSON.parse(stored);
+        if (
+          parsed &&
+          parsed.selectedLocation &&
+          Array.isArray(parsed.routesData) &&
+          parsed.routesData.length > 0
+        ) {
+          setSelectedLocation(parsed.selectedLocation);
+          setRoutesData(parsed.routesData);
+          setSelectedRouteIndex(
+            Number.isInteger(parsed.selectedRouteIndex) ? parsed.selectedRouteIndex : 0
+          );
+        }
+      } catch (error) {
+        console.warn('Failed to load stored route snapshot', error);
+      }
+    };
+
+    loadStoredRouteSnapshot();
+  }, []);
 
   // Handle selected location from SearchLocationsScreen
   useEffect(() => {
@@ -87,20 +274,71 @@ const RoutesScreen = ({ navigation, route }) => {
       const end = `${destination.longitude},${destination.latitude}`;
 
       const response = await fetch(
-        `https://router.project-osrm.org/route/v1/driving/${start};${end}?alternatives=true&geometries=geojson&overview=full`
+        `https://router.project-osrm.org/route/v1/driving/${start};${end}?alternatives=true&geometries=geojson&overview=full&steps=true&annotations=true`
       );
       const data = await response.json();
 
-      const osrmRoutes = (data.routes || []).map((route, index) => ({
-        id: `${destination?.id || destination?.name || 'route'}-${index}`,
-        coordinates: (route.geometry?.coordinates || []).map((coord) => ({
-          latitude: coord[1],
-          longitude: coord[0],
-        })),
-        distance: route.distance,
-        duration: route.duration,
-        label: index === 0 ? 'Fastest' : `Alternative ${index}`,
-      }));
+      const osrmRoutes = (data.routes || []).map((route, index) => {
+        const segments = (route.legs || []).flatMap((leg, legIndex) =>
+          (leg.steps || []).map((step, stepIndex) => {
+            const rawStreetName =
+              typeof step.name === 'string' && step.name.trim().length > 0 ? step.name.trim() : null;
+            const fallbackStreetName = [step.ref, step.destinations, step.rotary_name]
+              .find((value) => typeof value === 'string' && value.trim().length > 0)
+              ?.trim() || null;
+            const stepCoords = Array.isArray(step.geometry?.coordinates)
+              ? step.geometry.coordinates
+              : [];
+            const maneuverLocation = Array.isArray(step.maneuver?.location)
+              ? {
+                  latitude: step.maneuver.location[1],
+                  longitude: step.maneuver.location[0],
+                }
+              : null;
+
+            return {
+              id: `segment-${index}-${legIndex}-${stepIndex}`,
+              legIndex,
+              stepIndex,
+              streetName: rawStreetName || fallbackStreetName,
+              hasStreetName: Boolean(rawStreetName || fallbackStreetName),
+              distance: step.distance ?? 0,
+              duration: step.duration ?? 0,
+              mode: step.mode || null,
+              ref: step.ref || null,
+              drivingSide: step.driving_side || null,
+              maneuverType: step.maneuver?.type || null,
+              maneuverModifier: step.maneuver?.modifier || null,
+              maneuverLocation,
+              coordinates: stepCoords.map((coord) => ({
+                latitude: coord[1],
+                longitude: coord[0],
+              })),
+            };
+          })
+        );
+
+        return {
+          id: index + 1,
+          coordinates: (route.geometry?.coordinates || []).map((coord) => ({
+            latitude: coord[1],
+            longitude: coord[0],
+          })),
+          distance: route.distance,
+          duration: route.duration,
+          safetyScore: null,
+          color: theme.colors.primary,
+          segments,
+          streetNames: Array.from(
+            new Set(
+              segments
+                .map((segment) => segment.streetName)
+                .filter((name) => typeof name === 'string' && name.trim().length > 0)
+            )
+          ),
+          label: index === 0 ? 'Fastest' : `Alternative ${index}`,
+        };
+      });
 
       const sortedRoutes = osrmRoutes
         .filter((route) => route.coordinates.length > 0)
@@ -114,7 +352,53 @@ const RoutesScreen = ({ navigation, route }) => {
       setRoutesData(sortedRoutes);
       setSelectedRouteIndex(0);
 
-      const primaryRoute = sortedRoutes[0];
+      let routesWithSafety = sortedRoutes;
+      const safetyPayloadRoutes = buildSafetyPayloadRoutes(sortedRoutes);
+      const safetyPayload = {
+        origin_lat: userLocation.latitude,
+        origin_lng: userLocation.longitude,
+        destination_lat: destination.latitude,
+        destination_lng: destination.longitude,
+        timestamp: new Date().toISOString(),
+        routes: safetyPayloadRoutes,
+      };
+
+      try {
+        setIsSafetyLoading(true);
+        const safetyResults = await getRouteSafety(safetyPayload);
+        const safetyScoreByRouteId = new Map(
+          (Array.isArray(safetyResults) ? safetyResults : []).map((item) => [
+            Number(item.route_id),
+            Number(item.safety_score),
+          ])
+        );
+
+        routesWithSafety = sortedRoutes.map((route, index) => {
+          const routeId = Number(route.id) || index + 1;
+          const safetyScore = safetyScoreByRouteId.get(routeId);
+
+          return {
+            ...route,
+            safetyScore: Number.isFinite(safetyScore) ? safetyScore : null,
+            color: getSafetyColor(safetyScore),
+          };
+        });
+
+        setRoutesData(routesWithSafety);
+      } catch (safetyError) {
+        console.error('Error getting route safety:', safetyError);
+      } finally {
+        setIsSafetyLoading(false);
+      }
+
+      await persistRouteSnapshot({
+        location: destination,
+        routes: routesWithSafety,
+        selectedIndex: 0,
+        origin: userLocation,
+      });
+
+      const primaryRoute = routesWithSafety[0];
 
       if (mapRef.current && primaryRoute.coordinates.length > 0) {
         setTimeout(() => {
@@ -135,6 +419,13 @@ const RoutesScreen = ({ navigation, route }) => {
   const handleRouteSelect = (index) => {
     setSelectedRouteIndex(index);
     const selectedRoute = routesData[index];
+
+    persistRouteSnapshot({
+      location: selectedLocation,
+      routes: routesData,
+      selectedIndex: index,
+      origin: userLocation,
+    });
 
     if (selectedRoute && mapRef.current && selectedRoute.coordinates.length > 0) {
       mapRef.current.fitToCoordinates(selectedRoute.coordinates, {
@@ -216,6 +507,22 @@ const RoutesScreen = ({ navigation, route }) => {
                 />
               ))}
 
+              {routesData.map((route) => {
+                const circleStyle = getSafetyCircleStyle(route.safetyScore);
+                const sampledCirclePoints = sampleCoordinatesForMapCircles(route.coordinates);
+
+                return sampledCirclePoints.map((point, pointIndex) => (
+                  <Circle
+                    key={`route-safety-circle-${route.id}-${pointIndex}`}
+                    center={point}
+                    radius={50}
+                    strokeColor={circleStyle.strokeColor}
+                    fillColor={circleStyle.fillColor}
+                    strokeWidth={1}
+                  />
+                ));
+              })}
+
               {/* Duration Labels */}
               {routesData.map((route, index) => {
                 if (!route.coordinates.length) return null;
@@ -256,7 +563,14 @@ const RoutesScreen = ({ navigation, route }) => {
                     <Text style={styles.locationName}>{selectedLocation.name}</Text>
                     <Text style={styles.locationAddress}>{selectedLocation.address}</Text>
                   </View>
-                  <TouchableOpacity onPress={() => setSelectedLocation(null)}>
+                  <TouchableOpacity
+                    onPress={() => {
+                      setSelectedLocation(null);
+                      setRoutesData([]);
+                      setSelectedRouteIndex(0);
+                      clearStoredRouteSnapshot();
+                    }}
+                  >
                     <MaterialIcons name="close" size={24} color={theme.colors.text} />
                   </TouchableOpacity>
                 </View>
@@ -307,14 +621,29 @@ const RoutesScreen = ({ navigation, route }) => {
                         key={route.id}
                         style={[
                           styles.routeChip,
-                          index === selectedRouteIndex && styles.routeChipActive,
+                          {
+                            backgroundColor: getRouteChipPalette(
+                              route.safetyScore,
+                              index === selectedRouteIndex
+                            ).backgroundColor,
+                            borderColor: getRouteChipPalette(
+                              route.safetyScore,
+                              index === selectedRouteIndex
+                            ).borderColor,
+                            borderWidth: index === selectedRouteIndex ? 2 : 1,
+                          },
                         ]}
                         onPress={() => handleRouteSelect(index)}
                       >
                         <Text
                           style={[
                             styles.routeChipLabel,
-                            index === selectedRouteIndex && styles.routeChipLabelActive,
+                            {
+                              color: getRouteChipPalette(
+                                route.safetyScore,
+                                index === selectedRouteIndex
+                              ).labelColor,
+                            },
                           ]}
                         >
                           {route.label || `Route ${index + 1}`}
@@ -322,7 +651,12 @@ const RoutesScreen = ({ navigation, route }) => {
                         <Text
                           style={[
                             styles.routeChipMeta,
-                            index === selectedRouteIndex && styles.routeChipMetaActive,
+                            {
+                              color: getRouteChipPalette(
+                                route.safetyScore,
+                                index === selectedRouteIndex
+                              ).metaColor,
+                            },
                           ]}
                         >
                           {`${Math.round(route.duration / 60)} min • ${(route.distance / 1000).toFixed(1)} km`}
@@ -335,9 +669,12 @@ const RoutesScreen = ({ navigation, route }) => {
             )}
 
             {/* Loading Overlay */}
-            {loading && (
+            {(loading || isSafetyLoading) && (
               <View style={styles.routeLoadingOverlay}>
                 <ActivityIndicator size="large" color={theme.colors.primary} />
+                <Text style={styles.routeLoadingText}>
+                  {isSafetyLoading ? 'Analyzing route safety...' : 'Loading route...'}
+                </Text>
               </View>
             )}
           </View>
@@ -451,6 +788,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     borderRadius: 0,
+  },
+  routeLoadingText: {
+    marginTop: 10,
+    fontSize: 14,
+    color: '#FFF',
+    fontWeight: '600',
   },
   routeInfoPanel: {
     position: 'absolute',
