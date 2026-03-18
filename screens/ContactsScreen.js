@@ -2,8 +2,9 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigation } from '@react-navigation/native';
 import {
-  View, Text, FlatList, TouchableOpacity, Modal, StyleSheet, SafeAreaView, Alert, TextInput
+  View, Text, FlatList, TouchableOpacity, Modal, StyleSheet, Alert, TextInput
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Contacts from 'expo-contacts';
 import { Ionicons } from '@expo/vector-icons';

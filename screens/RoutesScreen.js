@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -6,20 +6,29 @@ import {
   ScrollView,
   ActivityIndicator,
   StyleSheet,
-  SafeAreaView,
   Alert,
 } from 'react-native';
 import MapView, { Marker, Polyline, Circle, PROVIDER_GOOGLE } from 'react-native-maps';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { MaterialIcons } from '@expo/vector-icons';
 import theme from '../styles/theme';
 import { getRouteSafety } from '../services/routeSafetyService';
+import {
+  checkGeoFence,
+  fetchDangerZones,
+  GEOFENCE_WARNING_MESSAGE_TEXT,
+  setGeoFenceAlertStatus,
+  requestSafeRoute,
+  sendGeoFenceWarningNotification,
+} from '../services/geoFenceService';
 
 const ROUTES_STORAGE_KEY = '@routes_last_snapshot';
 const SAFETY_SAMPLE_INTERVAL = 5;
 const MAP_SAFETY_CIRCLE_INTERVAL = 15;
+const GEO_FENCE_CHECK_INTERVAL = 5000;
 
 const getSafetyColor = (score) => {
   if (typeof score !== 'number') return theme.colors.primary;
@@ -97,6 +106,10 @@ const sampleCoordinatesForSafety = (coordinates = [], interval = SAFETY_SAMPLE_I
     return [];
   }
 
+  if (coordinates.length <= 10) {
+    return coordinates;
+  }
+
   const sampled = coordinates.filter((_, index) => index % interval === 0);
   const lastCoordinate = coordinates[coordinates.length - 1];
   const alreadyHasLast = sampled[sampled.length - 1] === lastCoordinate;
@@ -139,24 +152,91 @@ const getSafetyCircleStyle = (score) => {
 const sampleCoordinatesForMapCircles = (coordinates = []) =>
   sampleCoordinatesForSafety(coordinates, MAP_SAFETY_CIRCLE_INTERVAL);
 
+const getSafetyScoreText = (score) =>
+  typeof score === 'number' ? `Safety: ${Math.round(score)}` : 'Analyzing...';
+
+const getSafetyScoreTextColor = (score) => {
+  if (typeof score !== 'number') return '#7C7C7C';
+  if (score > 70) return '#2FAD65';
+  if (score >= 40) return '#F39C12';
+  return '#E74C3C';
+};
+
 const buildSafetyPayloadRoutes = (routes = []) =>
-  routes.map((route, index) => ({
-    route_id: Number(route.id) || index + 1,
+  routes.map((route) => ({
+    route_id: route.routeId,
     coordinates: sampleCoordinatesForSafety(route.coordinates).map((point) => ({
       lat: point.latitude,
       lng: point.longitude,
     })),
   }));
 
+const mergeSafeRouteScores = (routes = [], safetyResults = []) => {
+  const safetyScoreByRouteId = new Map(
+    (Array.isArray(safetyResults) ? safetyResults : []).map((item) => [
+      Number(item.route_id),
+      Number(item.safety_score),
+    ])
+  );
+
+  return routes.map((route) => {
+    const nextSafetyScore = safetyScoreByRouteId.get(route.routeId);
+    const safetyScore = Number.isFinite(nextSafetyScore)
+      ? nextSafetyScore
+      : route.safetyScore ?? null;
+
+    return {
+      ...route,
+      safetyScore,
+      color: getSafetyColor(safetyScore),
+    };
+  });
+};
+
 const RoutesScreen = ({ navigation, route }) => {
   const mapRef = useRef(null);
   const [userLocation, setUserLocation] = useState(null);
   const [selectedLocation, setSelectedLocation] = useState(null);
+  const [dangerZones, setDangerZones] = useState([]);
+  const [geoFenceWarning, setGeoFenceWarning] = useState(null);
   const [routesData, setRoutesData] = useState([]);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
   const [loading, setLoading] = useState(false);
   const [isSafetyLoading, setIsSafetyLoading] = useState(false);
   const [mapLoading, setMapLoading] = useState(true);
+  const selectedRouteIndexRef = useRef(0);
+  const routesDataRef = useRef([]);
+  const selectedLocationRef = useRef(null);
+  const dangerZonesRef = useRef([]);
+  const activeDangerZoneIdsRef = useRef(new Set());
+  const isGeoFenceRecalcInFlightRef = useRef(false);
+
+  useEffect(() => {
+    selectedRouteIndexRef.current = selectedRouteIndex;
+  }, [selectedRouteIndex]);
+
+  useEffect(() => {
+    routesDataRef.current = routesData;
+  }, [routesData]);
+
+  useEffect(() => {
+    selectedLocationRef.current = selectedLocation;
+  }, [selectedLocation]);
+
+  useEffect(() => {
+    dangerZonesRef.current = dangerZones;
+  }, [dangerZones]);
+
+  useEffect(() => {
+    if (!userLocation || dangerZones.length === 0) {
+      return;
+    }
+
+    evaluateGeoFence({
+      latitude: userLocation.latitude,
+      longitude: userLocation.longitude,
+    });
+  }, [dangerZones.length, evaluateGeoFence, userLocation]);
 
   const clearStoredRouteSnapshot = async () => {
     try {
@@ -211,6 +291,27 @@ const RoutesScreen = ({ navigation, route }) => {
     loadStoredRouteSnapshot();
   }, []);
 
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadDangerZoneData = async () => {
+      try {
+        const zones = await fetchDangerZones();
+        if (isMounted) {
+          setDangerZones(zones);
+        }
+      } catch (error) {
+        console.error('Error fetching danger zones:', error);
+      }
+    };
+
+    loadDangerZoneData();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   // Handle selected location from SearchLocationsScreen
   useEffect(() => {
   if (route?.params?.selectedLocation && userLocation) {
@@ -227,6 +328,92 @@ const RoutesScreen = ({ navigation, route }) => {
   }
 }, [route?.params?.selectedLocation, userLocation]);
 
+    const handleGeoFenceEntry = useCallback(async (zone, currentCoords) => {
+      setGeoFenceWarning(GEOFENCE_WARNING_MESSAGE_TEXT);
+
+      try {
+        await sendGeoFenceWarningNotification(zone);
+      } catch (notificationError) {
+        console.error('Error sending geo-fence notification:', notificationError);
+      }
+
+      Alert.alert(
+        'High-risk area detected',
+        `${GEOFENCE_WARNING_MESSAGE_TEXT}\nWe suggest recalculating the route.`
+      );
+
+      const currentDestination = selectedLocationRef.current;
+      const currentRoutes = routesDataRef.current;
+
+      if (
+        !currentDestination ||
+        !Array.isArray(currentRoutes) ||
+        currentRoutes.length === 0 ||
+        isGeoFenceRecalcInFlightRef.current
+      ) {
+        return;
+      }
+
+      isGeoFenceRecalcInFlightRef.current = true;
+      setIsSafetyLoading(true);
+
+      try {
+        const safeRouteResults = await requestSafeRoute({
+          origin_lat: currentCoords.latitude,
+          origin_lng: currentCoords.longitude,
+          destination_lat: currentDestination.latitude,
+          destination_lng: currentDestination.longitude,
+          timestamp: new Date().toISOString(),
+          routes: buildSafetyPayloadRoutes(currentRoutes),
+        });
+
+        const recalculatedRoutes = mergeSafeRouteScores(currentRoutes, safeRouteResults);
+        setRoutesData(recalculatedRoutes);
+      } catch (safeRouteError) {
+        console.error('Error recalculating safe route after geo-fence hit:', safeRouteError);
+      } finally {
+        isGeoFenceRecalcInFlightRef.current = false;
+        setIsSafetyLoading(false);
+      }
+    }, []);
+
+    const evaluateGeoFence = useCallback(async (currentCoords) => {
+      const hadActiveZones = activeDangerZoneIdsRef.current.size > 0;
+      const matchedZones = checkGeoFence(currentCoords, dangerZonesRef.current);
+      const nextActiveIds = new Set(matchedZones.map((zone) => zone.id));
+      const newlyEnteredZones = matchedZones.filter(
+        (zone) => !activeDangerZoneIdsRef.current.has(zone.id)
+      );
+
+      activeDangerZoneIdsRef.current = nextActiveIds;
+
+      if (!matchedZones.length) {
+        setGeoFenceWarning(null);
+
+        if (hadActiveZones) {
+          setGeoFenceAlertStatus({
+            active: false,
+            message: GEOFENCE_WARNING_MESSAGE_TEXT,
+          });
+        }
+
+        return;
+      }
+
+      setGeoFenceWarning(GEOFENCE_WARNING_MESSAGE_TEXT);
+
+      if (newlyEnteredZones.length > 0 || !hadActiveZones) {
+        setGeoFenceAlertStatus({
+          active: true,
+          message: GEOFENCE_WARNING_MESSAGE_TEXT,
+        });
+      }
+
+      if (newlyEnteredZones.length > 0) {
+        await handleGeoFenceEntry(newlyEnteredZones[0], currentCoords);
+      }
+    }, [handleGeoFenceEntry]);
+
   // Get user's location
   useEffect(() => {
     const getUserLocation = async () => {
@@ -238,28 +425,75 @@ const RoutesScreen = ({ navigation, route }) => {
         }
 
         const location = await Location.getCurrentPositionAsync({});
-        setUserLocation({
+        const currentUserLocation = {
           latitude: location.coords.latitude,
           longitude: location.coords.longitude,
           latitudeDelta: 0.05,
           longitudeDelta: 0.05,
-        });
+        };
+        setUserLocation(currentUserLocation);
+        evaluateGeoFence(location.coords);
       } catch (error) {
         console.error('Error getting location:', error);
         // Default location (Lahore, Pakistan)
-        setUserLocation({
+        const fallbackLocation = {
           latitude: 31.5497,
           longitude: 74.3436,
           latitudeDelta: 0.05,
           longitudeDelta: 0.05,
-        });
+        };
+        setUserLocation(fallbackLocation);
+        evaluateGeoFence(fallbackLocation);
       } finally {
         setMapLoading(false);
       }
     };
 
     getUserLocation();
-  }, []);
+  }, [evaluateGeoFence]);
+
+  useEffect(() => {
+    if (dangerZones.length === 0) {
+      return undefined;
+    }
+
+    let isActive = true;
+
+    const pollLocation = async () => {
+      try {
+        const { status } = await Location.getForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          return;
+        }
+
+        const position = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+
+        if (!isActive) {
+          return;
+        }
+
+        setUserLocation((previousLocation) => ({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+          latitudeDelta: previousLocation?.latitudeDelta ?? 0.05,
+          longitudeDelta: previousLocation?.longitudeDelta ?? 0.05,
+        }));
+
+        await evaluateGeoFence(position.coords);
+      } catch (error) {
+        console.error('Error checking geo-fence location:', error);
+      }
+    };
+
+    const intervalId = setInterval(pollLocation, GEO_FENCE_CHECK_INTERVAL);
+
+    return () => {
+      isActive = false;
+      clearInterval(intervalId);
+    };
+  }, [dangerZones.length, evaluateGeoFence]);
 
   // Get route from OSRM
   const getRoute = async (destination) => {
@@ -320,6 +554,7 @@ const RoutesScreen = ({ navigation, route }) => {
 
         return {
           id: index + 1,
+          routeId: index + 1,
           coordinates: (route.geometry?.coordinates || []).map((coord) => ({
             latitude: coord[1],
             longitude: coord[0],
@@ -373,8 +608,8 @@ const RoutesScreen = ({ navigation, route }) => {
           ])
         );
 
-        routesWithSafety = sortedRoutes.map((route, index) => {
-          const routeId = Number(route.id) || index + 1;
+        routesWithSafety = sortedRoutes.map((route) => {
+          const routeId = route.routeId;
           const safetyScore = safetyScoreByRouteId.get(routeId);
 
           return {
@@ -402,6 +637,10 @@ const RoutesScreen = ({ navigation, route }) => {
 
       if (mapRef.current && primaryRoute.coordinates.length > 0) {
         setTimeout(() => {
+          if (!mapRef.current || primaryRoute.coordinates.length === 0) {
+            return;
+          }
+
           mapRef.current.fitToCoordinates(primaryRoute.coordinates, {
             edgePadding: { top: 100, right: 50, bottom: 140, left: 50 },
             animated: true,
@@ -556,6 +795,44 @@ const RoutesScreen = ({ navigation, route }) => {
               })}
             </MapView>
 
+            <View style={styles.safetyLegendCard} pointerEvents="none">
+              <View style={styles.safetyLegendRow}>
+                <View style={[styles.safetyLegendDot, { backgroundColor: '#2FAD65' }]} />
+                <Text style={styles.safetyLegendText}>Safe ({'>'}70)</Text>
+              </View>
+              <View style={styles.safetyLegendRow}>
+                <View style={[styles.safetyLegendDot, { backgroundColor: '#F39C12' }]} />
+                <Text style={styles.safetyLegendText}>Moderate (40–70)</Text>
+              </View>
+              <View style={styles.safetyLegendRow}>
+                <View style={[styles.safetyLegendDot, { backgroundColor: '#E74C3C' }]} />
+                <Text style={styles.safetyLegendText}>Unsafe ({'<'}40)</Text>
+              </View>
+            </View>
+
+            {isSafetyLoading && (
+              <View style={styles.safetyLoadingBanner} pointerEvents="none">
+                <ActivityIndicator size="small" color={theme.colors.primary} />
+                <Text style={styles.safetyLoadingBannerText}>Analyzing route safety...</Text>
+              </View>
+            )}
+
+            {geoFenceWarning && (
+              <View
+                style={[
+                  styles.geoFenceAlertBanner,
+                  isSafetyLoading && styles.geoFenceAlertBannerOffset,
+                ]}
+                pointerEvents="none"
+              >
+                <MaterialIcons name="warning-amber" size={18} color="#B42318" />
+                <View style={styles.geoFenceAlertContent}>
+                  <Text style={styles.geoFenceAlertText}>{geoFenceWarning}</Text>
+                  <Text style={styles.geoFenceAlertSubtext}>Suggested action: recalculate route.</Text>
+                </View>
+              </View>
+            )}
+
             {selectedLocation && (
               <View style={styles.routeInfoPanel}>
                 <View style={styles.panelHeader}>
@@ -661,6 +938,14 @@ const RoutesScreen = ({ navigation, route }) => {
                         >
                           {`${Math.round(route.duration / 60)} min • ${(route.distance / 1000).toFixed(1)} km`}
                         </Text>
+                        <Text
+                          style={[
+                            styles.routeChipSafety,
+                            { color: getSafetyScoreTextColor(route.safetyScore) },
+                          ]}
+                        >
+                          {getSafetyScoreText(route.safetyScore)}
+                        </Text>
                       </TouchableOpacity>
                     ))}
                   </ScrollView>
@@ -669,12 +954,10 @@ const RoutesScreen = ({ navigation, route }) => {
             )}
 
             {/* Loading Overlay */}
-            {(loading || isSafetyLoading) && (
+            {loading && (
               <View style={styles.routeLoadingOverlay}>
                 <ActivityIndicator size="large" color={theme.colors.primary} />
-                <Text style={styles.routeLoadingText}>
-                  {isSafetyLoading ? 'Analyzing route safety...' : 'Loading route...'}
-                </Text>
+                <Text style={styles.routeLoadingText}>Loading route...</Text>
               </View>
             )}
           </View>
@@ -925,6 +1208,11 @@ const styles = StyleSheet.create({
     color: '#666',
     marginTop: 2,
   },
+  routeChipSafety: {
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 2,
+  },
   routeChipMetaActive: {
     color: 'rgba(255, 255, 255, 0.9)',
   },
@@ -947,6 +1235,92 @@ const styles = StyleSheet.create({
   },
   durationTextActive: {
     color: '#FFF',
+  },
+  safetyLegendCard: {
+    position: 'absolute',
+    top: 12,
+    right: 12,
+    backgroundColor: '#FFF',
+    borderRadius: 12,
+    padding: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  safetyLegendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 1,
+  },
+  safetyLegendDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 6,
+  },
+  safetyLegendText: {
+    fontSize: 11,
+    color: '#444',
+  },
+  safetyLoadingBanner: {
+    position: 'absolute',
+    top: 12,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFF',
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  safetyLoadingBannerText: {
+    marginLeft: 8,
+    fontSize: 12,
+    fontWeight: '600',
+    color: theme.colors.text,
+  },
+  geoFenceAlertBanner: {
+    position: 'absolute',
+    top: 56,
+    left: 16,
+    right: 16,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: '#FEECEC',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: '#F7C9C5',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  geoFenceAlertBannerOffset: {
+    top: 102,
+  },
+  geoFenceAlertContent: {
+    flex: 1,
+    marginLeft: 8,
+  },
+  geoFenceAlertText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#B42318',
+  },
+  geoFenceAlertSubtext: {
+    fontSize: 12,
+    color: '#7A271A',
+    marginTop: 2,
   },
 });
 

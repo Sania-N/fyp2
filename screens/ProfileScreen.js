@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { 
   View, Text, Image, TouchableOpacity, StyleSheet,
-  TextInput, Alert, ActivityIndicator, ScrollView, SafeAreaView
+  TextInput, Alert, ActivityIndicator, ScrollView
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import theme from '../styles/theme';

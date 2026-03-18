@@ -116,7 +116,12 @@ export async function uploadRecording(
       panic: result.panic,
     });
 
-    return audioUrl;
+    return {
+      audioUrl,
+      emotion: result.emotion,
+      confidence: result.confidence,
+      panic: result.panic,
+    };
   } catch (err) {
     console.error("uploadRecording failed", err);
     throw err;

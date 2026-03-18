@@ -24,7 +24,8 @@
         {
           "contactsPermission": "Allow $(PRODUCT_NAME) to access your contacts to add trusted emergency contacts."
         }
-      ]
+      ],
+      "expo-notifications"
     ],
     "ios": {
       "supportsTablet": true,
@@ -42,6 +43,7 @@
         "backgroundColor": "#ffffff"
       },
       "permissions": [
+        "POST_NOTIFICATIONS",
         "CAMERA",
         "RECORD_AUDIO",
         "READ_CONTACTS"

@@ -20,6 +20,9 @@ import { useAuth } from "../useAuth";
 import { uploadRecording } from "../services/recordingsService";
 import { requestCameraPermission } from "../services/cameraService";
 import { useKeepAwake } from "expo-keep-awake";
+import { analyzeUserDangerLevel, isDangerRisk } from "../services/dangerDetectionService";
+import { useDangerAlert } from "../context/DangerAlertContext";
+import { addGeoFenceAlertHistoryItem } from "../services/geoFenceService";
 
 export default function RecordScreen() {
   useKeepAwake();
@@ -44,6 +47,7 @@ export default function RecordScreen() {
 
   const navigation = useNavigation();
   const user = useAuth();
+  const { showDangerAlert } = useDangerAlert();
 
   // Permission
   useEffect(() => {
@@ -151,7 +155,8 @@ export default function RecordScreen() {
         await captureImagesFromBothCameras();
       }
 
-      await uploadRecording(
+      // Upload recording and get emotion data
+      const uploadResult = await uploadRecording(
         user.uid,
         finalPath,
         frontImageUri,
@@ -163,6 +168,51 @@ export default function RecordScreen() {
       setFrontImageUri(null);
       setBackImageUri(null);
       recordingRef.current = null;
+
+      // ⚡ DANGER DETECTION FLOW
+      try {
+        if (uploadResult && uploadResult.confidence) {
+          console.log(
+            `📊 Analyzing danger level... (emotion: ${uploadResult.emotion}, confidence: ${uploadResult.confidence})`
+          );
+
+          // Call multimodal-predict to assess danger
+          const dangerAnalysis = await analyzeUserDangerLevel(uploadResult.confidence);
+          console.log(`🔍 Danger analysis: ${dangerAnalysis.risk_level}`);
+
+          // If DANGER detected, show popup
+          if (isDangerRisk(dangerAnalysis.risk_level)) {
+            console.log("🚨 DANGER DETECTED! Showing safety popup...");
+            await addGeoFenceAlertHistoryItem({
+              message: `Danger detected: emotion=${uploadResult.emotion || "unknown"}, confidence=${Number(uploadResult.confidence).toFixed(3)}, risk=${dangerAnalysis.risk_level}. Safety popup shown with 60s timer.`,
+              eventType: "DANGER_DETECTED",
+              details: {
+                emotion: uploadResult.emotion || "unknown",
+                emotionConfidence: Number(uploadResult.confidence),
+                riskLevel: dangerAnalysis.risk_level,
+                motion: dangerAnalysis?.motion_used,
+                heartRate: dangerAnalysis?.heart_rate_used,
+              },
+            });
+            showDangerAlert();
+          } else {
+            await addGeoFenceAlertHistoryItem({
+              message: `No immediate danger: emotion=${uploadResult.emotion || "unknown"}, confidence=${Number(uploadResult.confidence).toFixed(3)}, risk=${dangerAnalysis.risk_level}.`,
+              eventType: "NO_IMMEDIATE_DANGER",
+              details: {
+                emotion: uploadResult.emotion || "unknown",
+                emotionConfidence: Number(uploadResult.confidence),
+                riskLevel: dangerAnalysis.risk_level,
+                motion: dangerAnalysis?.motion_used,
+                heartRate: dangerAnalysis?.heart_rate_used,
+              },
+            });
+          }
+        }
+      } catch (dangerError) {
+        console.warn("⚠️ Danger detection error:", dangerError);
+        // Don't block user if danger detection fails
+      }
     } catch (err) {
       console.log("stopRecording error:", err);
       Alert.alert("Failed", "Audio upload failed.");

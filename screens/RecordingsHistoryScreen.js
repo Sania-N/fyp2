@@ -6,13 +6,13 @@ import {
   FlatList,
   StyleSheet,
   TouchableOpacity,
-  SafeAreaView,
   Image,
   ActivityIndicator,
   Alert,
   Modal,
   TextInput,
 } from "react-native";
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import theme from "../styles/theme";

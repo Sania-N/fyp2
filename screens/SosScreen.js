@@ -18,6 +18,8 @@ import * as Location from 'expo-location';
 import { Linking } from 'react-native';
 import { auth } from '../firebase';
 import { getUserContacts } from '../services/contactService';
+import { sendSOSConfirmation } from '../services/notificationsService';
+import { getGeoFenceAlertHistory } from '../services/geoFenceService';
 
 export default function SosScreen() {
   const [sending, setSending] = useState(false);
@@ -32,29 +34,117 @@ export default function SosScreen() {
     return withoutPlus;
   };
 
-  // Generate SOS message with location
-  const generateSOSMessage = (latitude, longitude) => {
+  const isSameLocalDay = (timestamp, referenceDate = new Date()) => {
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) return false;
+
+    return (
+      date.getFullYear() === referenceDate.getFullYear() &&
+      date.getMonth() === referenceDate.getMonth() &&
+      date.getDate() === referenceDate.getDate()
+    );
+  };
+
+  const toSafeNumber = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const toClockTime = (timestamp) => {
+    try {
+      return new Date(timestamp).toLocaleTimeString();
+    } catch {
+      return '';
+    }
+  };
+
+  const buildAlertDetailLine = (alert) => {
+    const details = alert?.details || {};
+    const parts = [];
+
+    if (details.emotion) parts.push(`emotion=${details.emotion}`);
+
+    const confidence = toSafeNumber(details.emotionConfidence);
+    if (confidence !== null) parts.push(`confidence=${confidence.toFixed(3)}`);
+
+    const motion = toSafeNumber(details.motion);
+    if (motion !== null) parts.push(`motion=${motion.toFixed(2)}`);
+
+    const heartRate = toSafeNumber(details.heartRate);
+    if (heartRate !== null) parts.push(`heart_rate=${heartRate.toFixed(0)} bpm`);
+
+    if (details.riskLevel) parts.push(`risk=${details.riskLevel}`);
+    if (details.buttonPressed === true) parts.push('button_pressed=true');
+    if (details.sosSent === true) parts.push('sos_sent=true');
+    if (details.sosSent === false) parts.push('sos_sent=false');
+    if (details.contactName) parts.push(`contact=${details.contactName}`);
+    if (details.reason) parts.push(`reason=${details.reason}`);
+    if (details.action) parts.push(`action=${details.action}`);
+
+    const timerRemaining = toSafeNumber(details.timerRemaining);
+    if (timerRemaining !== null) parts.push(`timer_remaining=${timerRemaining}s`);
+
+    if (parts.length === 0) {
+      return 'No extra details';
+    }
+
+    return parts.join(', ');
+  };
+
+  const buildTodaysAlertsContext = async () => {
+    try {
+      const history = await getGeoFenceAlertHistory();
+      const todayItems = history
+        .filter((item) => isSameLocalDay(item?.timestamp))
+        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+      if (todayItems.length === 0) {
+        return 'DETAILS (Today):\nNo alert events recorded today.';
+      }
+
+      const rows = todayItems.map((item, index) => {
+        const timeText = toClockTime(item?.timestamp) || 'Unknown time';
+        return `${index + 1}. [${timeText}] ${item?.message || 'Alert event'}\n   detail: ${buildAlertDetailLine(item)}`;
+      });
+
+      return `DETAILS (Today):\n${rows.join('\n')}`;
+    } catch (error) {
+      console.warn('Failed to load today alert context for SOS message:', error);
+      return 'DETAILS (Today):\nCould not load alert details.';
+    }
+  };
+
+  // Generate SOS message with location + today's alert details
+  const generateSOSMessage = async (latitude, longitude) => {
     const googleMapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
-    return `🚨 SOS ALERT 🚨\n\nI am in danger. Please help me immediately!\n\n📍 Location:\n${latitude.toFixed(6)}, ${longitude.toFixed(6)}\n\n🗺️ ${googleMapsLink}\n\nSent from Safety App.`;
+    const detailsBlock = await buildTodaysAlertsContext();
+    return `🚨 SOS ALERT 🚨\n\nI am in danger. Please help me immediately!\n\n${detailsBlock}\n\n📍 Location:\n${latitude.toFixed(6)}, ${longitude.toFixed(6)}\n\n🗺️ ${googleMapsLink}\n\nSent from Safety App.`;
   };
 
   // Send WhatsApp message using wa.me/ deep link
   const sendWhatsAppMessage = async (phoneNumber, contactName, message) => {
     try {
       const formattedPhone = formatPhoneForWhatsApp(phoneNumber);
-      
-      // Using wa.me/ format: https://wa.me/PHONE_NUMBER?text=MESSAGE
-      const whatsappURL = `https://wa.me/${formattedPhone}?text=${encodeURIComponent(message)}`;
-      
-      // Check if the URL can be opened
-      const canOpen = await Linking.canOpenURL(whatsappURL);
-      
-      if (canOpen) {
-        await Linking.openURL(whatsappURL);
+
+      const encodedMessage = encodeURIComponent(message);
+      const directWhatsAppUrl = `whatsapp://send?phone=${formattedPhone}&text=${encodedMessage}`;
+      const webWhatsAppUrl = `https://wa.me/${formattedPhone}?text=${encodedMessage}`;
+
+      console.log(`📨 SOS message length: ${message.length} chars`);
+
+      const canOpenDirect = await Linking.canOpenURL(directWhatsAppUrl);
+      if (canOpenDirect) {
+        await Linking.openURL(directWhatsAppUrl);
         return true;
-      } else {
-        return false;
       }
+
+      const canOpenWeb = await Linking.canOpenURL(webWhatsAppUrl);
+      if (canOpenWeb) {
+        await Linking.openURL(webWhatsAppUrl);
+        return true;
+      }
+
+      return false;
     } catch (error) {
       console.error(`Error sending WhatsApp to ${contactName}:`, error);
       return false;
@@ -119,13 +209,18 @@ export default function SosScreen() {
       }
 
       // 5️⃣ Generate SOS message with location
-      const sosMessage = generateSOSMessage(latitude, longitude);
+      const sosMessage = await generateSOSMessage(latitude, longitude);
 
       // 6️⃣ Send SOS to priority contact via WhatsApp
       const success = await sendWhatsAppMessage(priorityContact.phone, priorityContact.name, sosMessage);
 
       // 7️⃣ Show result alert
       if (success) {
+        await sendSOSConfirmation({
+          contactName: priorityContact.name,
+          timestamp: new Date().toISOString(),
+        });
+
         Alert.alert(
           "✅ SOS Alert Sent",
           `Emergency SOS sent to ${priorityContact.name}.\n\nWhatsApp will open to confirm sending.`

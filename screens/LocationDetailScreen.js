@@ -1,22 +1,34 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
   StyleSheet,
-  SafeAreaView,
   Dimensions,
   Animated,
   PanResponder,
   TouchableOpacity,
   ScrollView,
   Alert,
+  ActivityIndicator,
 } from 'react-native';
 
 import MapView, { Marker, Polyline, Circle, PROVIDER_GOOGLE } from 'react-native-maps';
 import * as Location from 'expo-location';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { MaterialIcons } from '@expo/vector-icons';
 import theme from '../styles/theme';
 import { getRouteSafety } from '../services/routeSafetyService';
+import { useTravelSession } from '../context/TravelSessionContext';
+import {
+  addGeoFenceAlertHistoryItem,
+  checkGeoFence,
+  fetchDangerZones,
+  GEOFENCE_WARNING_MESSAGE_TEXT,
+  isRedZone,
+  setGeoFenceAlertStatus,
+  requestSafeRoute,
+  sendGeoFenceWarningNotification,
+} from '../services/geoFenceService';
 
 const { width, height } = Dimensions.get('window');
 const COLLAPSED_HEIGHT = height * 0.3; // 30% of screen height
@@ -52,29 +64,73 @@ const TRAVEL_MODE_CONFIG = {
     label: 'Drive',
     osrmProfile: 'driving',
     durationFactor: 1,
+    estimationFactor: 1,
     trafficStatus: 'Fastest route now due to traffic conditions',
-    fuelSaving: 11,
+    fuelSaving: 0,
   },
   transit: {
     icon: 'directions-transit-filled',
     label: 'Transit',
     osrmProfile: 'driving',
     durationFactor: 1.8,
+    estimationFactor: 1.8,
     trafficStatus: 'Transit estimate based on current traffic conditions',
-    fuelSaving: 24,
+    fuelSaving: 0,
   },
   walk: {
     icon: 'directions-walk',
     label: 'Walk',
     osrmProfile: 'foot',
     durationFactor: 1,
+    estimationFactor: 12,
     trafficStatus: 'Walking route based on shortest available path',
     fuelSaving: 100,
   },
 };
 
+const getFuelEfficiencyIndex = (route, modeKey) => {
+  const distanceKm = Math.max(0, Number(route?.distance || 0) / 1000);
+  const durationHours = Math.max(1 / 120, Number(route?.duration || 0) / 3600);
+  const averageSpeedKmh = distanceKm / durationHours;
+
+  if (modeKey === 'walk') return 0;
+
+  const baseFuelPerKm = modeKey === 'transit' ? 0.35 : 1;
+  const lowSpeedPenalty = averageSpeedKmh < 45 ? ((45 - averageSpeedKmh) / 45) * 0.3 : 0;
+
+  return distanceKm * baseFuelPerKm * (1 + lowSpeedPenalty);
+};
+
+const withCalculatedFuelSavings = (routes = [], modeKey) => {
+  const routesWithIndex = routes.map((routeItem) => ({
+    ...routeItem,
+    fuelEfficiencyIndex: getFuelEfficiencyIndex(routeItem, modeKey),
+  }));
+
+  const maxIndex = Math.max(...routesWithIndex.map((routeItem) => routeItem.fuelEfficiencyIndex), 0);
+
+  return routesWithIndex.map((routeItem) => {
+    const fuelSaving =
+      modeKey === 'walk'
+        ? 100
+        : maxIndex > 0
+          ? Math.max(0, Math.round(((maxIndex - routeItem.fuelEfficiencyIndex) / maxIndex) * 100))
+          : 0;
+
+    return {
+      ...routeItem,
+      fuelSaving,
+    };
+  });
+};
+
 const SAFETY_SAMPLE_INTERVAL = 5;
 const MAP_SAFETY_CIRCLE_INTERVAL = 15;
+const GEO_FENCE_CHECK_INTERVAL = 5000;
+const RED_ROUTE_SAFETY_THRESHOLD = 40;
+
+const isDangerousRoute = (route) =>
+  route && typeof route.safetyScore === 'number' && route.safetyScore < RED_ROUTE_SAFETY_THRESHOLD;
 
 const getSafetyColor = (score) => {
   if (typeof score !== 'number') return theme.colors.primary;
@@ -152,6 +208,10 @@ const sampleCoordinatesForSafety = (coordinates = [], interval = SAFETY_SAMPLE_I
     return [];
   }
 
+  if (coordinates.length <= 10) {
+    return coordinates;
+  }
+
   const sampled = coordinates.filter((_, index) => index % interval === 0);
   const lastCoordinate = coordinates[coordinates.length - 1];
   const alreadyHasLast = sampled[sampled.length - 1] === lastCoordinate;
@@ -194,22 +254,113 @@ const getSafetyCircleStyle = (score) => {
 const sampleCoordinatesForMapCircles = (coordinates = []) =>
   sampleCoordinatesForSafety(coordinates, MAP_SAFETY_CIRCLE_INTERVAL);
 
+const areCoordinatesClose = (pointA, pointB, epsilon = 0.00005) => {
+  if (!pointA || !pointB) return false;
+
+  return (
+    Math.abs(Number(pointA.latitude) - Number(pointB.latitude)) <= epsilon &&
+    Math.abs(Number(pointA.longitude) - Number(pointB.longitude)) <= epsilon
+  );
+};
+
+const getSafetyScoreText = (score) =>
+  typeof score === 'number' ? `Safety: ${Math.round(score)}` : 'Analyzing...';
+
+const getSafetyScoreTextColor = (score) => {
+  if (typeof score !== 'number') return '#7C7C7C';
+  if (score > 70) return '#2FAD65';
+  if (score >= 40) return '#F39C12';
+  return '#E74C3C';
+};
+
+const buildSafeRoutePayloadRoutes = (routes = []) =>
+  routes.map((routeItem) => ({
+    route_id: routeItem.routeId,
+    coordinates: sampleCoordinatesForSafety(routeItem.coordinates).map((point) => ({
+      lat: point.latitude,
+      lng: point.longitude,
+    })),
+  }));
+
+const mergeSafeRouteScores = (routes = [], safetyResults = []) => {
+  const safetyByRouteId = new Map(
+    (Array.isArray(safetyResults) ? safetyResults : []).map((item) => [
+      Number(item.route_id),
+      Number(item.safety_score),
+    ])
+  );
+
+  return routes.map((routeItem) => {
+    const nextSafetyScore = safetyByRouteId.get(routeItem.routeId);
+    const safetyScore = Number.isFinite(nextSafetyScore)
+      ? nextSafetyScore
+      : routeItem.safetyScore ?? null;
+
+    return {
+      ...routeItem,
+      safetyScore,
+      color: getSafetyColor(safetyScore),
+    };
+  });
+};
+
 const LocationDetailScreen = ({ navigation, route }) => {
   const initialDestination = route?.params?.location ?? null;
   const [userLocation, setUserLocation] = useState(null);
   const [origin, setOrigin] = useState(null);
   const [destination, setDestination] = useState(initialDestination);
+  const [dangerZones, setDangerZones] = useState([]);
+  const [geoFenceWarning, setGeoFenceWarning] = useState(null);
   const [routeCoordinates, setRouteCoordinates] = useState([]);
   const [routeAlternatives, setRouteAlternatives] = useState([]);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
+  const [hasExplicitRouteSelection, setHasExplicitRouteSelection] = useState(false);
   const [routeInfo, setRouteInfo] = useState(null);
   const [isSafetyLoading, setIsSafetyLoading] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isNavigating, setIsNavigating] = useState(false);
   const [selectedTravelMode, setSelectedTravelMode] = useState('drive');
   const mapRef = useRef(null);
+  const {
+    isTraveling,
+    startTravelSession,
+    stopTravelSession,
+    activeRouteIndex,
+    travelMode,
+  } = useTravelSession();
   const navigationSubscriptionRef = useRef(null);
   const selectedTravelModeRef = useRef('drive');
+  const selectedRouteIndexRef = useRef(0);
+  const dangerZonesRef = useRef([]);
+  const destinationRef = useRef(initialDestination);
+  const routeAlternativesRef = useRef([]);
+  const activeDangerZoneIdsRef = useRef(new Set());
+  const isGeoFenceRecalcInFlightRef = useRef(false);
+
+  const isSelectedRouteRed = useCallback(() => {
+    const selectedRoute = routeAlternativesRef.current[selectedRouteIndexRef.current];
+    return isDangerousRoute(selectedRoute);
+  }, []);
+
+  const showDangerousRouteAlert = useCallback(async (selectedRoute) => {
+    if (!isDangerousRoute(selectedRoute)) {
+      return;
+    }
+
+    const destinationName = destinationRef.current?.name || 'selected destination';
+    const message = `Danger alert: the route you are following to ${destinationName} is unsafe. Please switch to a safer route.`;
+
+    Alert.alert('Dangerous route selected', message);
+
+    await addGeoFenceAlertHistoryItem({
+      message,
+      zone: {
+        title: destinationName,
+        severity: 'red',
+      },
+      timestamp: new Date().toISOString(),
+    });
+  }, []);
 
   // Animated value for bottom sheet position
   const animatedValue = useRef(new Animated.Value(0)).current;
@@ -221,8 +372,45 @@ const LocationDetailScreen = ({ navigation, route }) => {
   }, [route?.params?.location]);
 
   useEffect(() => {
+    destinationRef.current = destination;
+  }, [destination]);
+
+  useEffect(() => {
     selectedTravelModeRef.current = selectedTravelMode;
   }, [selectedTravelMode]);
+
+  useEffect(() => {
+    selectedRouteIndexRef.current = selectedRouteIndex;
+  }, [selectedRouteIndex]);
+
+  useEffect(() => {
+    routeAlternativesRef.current = routeAlternatives;
+  }, [routeAlternatives]);
+
+  useEffect(() => {
+    dangerZonesRef.current = dangerZones;
+  }, [dangerZones]);
+
+  useEffect(() => {
+    if (!userLocation || dangerZones.length === 0) {
+      return;
+    }
+
+    evaluateGeoFence({
+      latitude: userLocation.latitude,
+      longitude: userLocation.longitude,
+    });
+  }, [dangerZones.length, evaluateGeoFence, userLocation]);
+
+  useEffect(() => {
+    setIsNavigating(isTraveling);
+  }, [isTraveling]);
+
+  useEffect(() => {
+    if (isTraveling && typeof travelMode === 'string' && travelMode.length > 0) {
+      setSelectedTravelMode(travelMode);
+    }
+  }, [isTraveling, travelMode]);
 
   const createRouteInfo = (route, modeKey) => {
     const modeConfig = TRAVEL_MODE_CONFIG[modeKey] || TRAVEL_MODE_CONFIG.drive;
@@ -244,7 +432,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
         year: 'numeric',
       }),
       trafficStatus: modeConfig.trafficStatus,
-      fuelSaving: modeConfig.fuelSaving,
+      fuelSaving: Number.isFinite(route?.fuelSaving) ? route.fuelSaving : modeConfig.fuelSaving,
       safetyScore: route?.safetyScore ?? null,
     };
   };
@@ -259,6 +447,10 @@ const LocationDetailScreen = ({ navigation, route }) => {
 
     if (mapRef.current && selected.coordinates.length > 0) {
       setTimeout(() => {
+        if (!mapRef.current || selected.coordinates.length === 0) {
+          return;
+        }
+
         mapRef.current.fitToCoordinates(selected.coordinates, {
           edgePadding: { top: 100, right: 50, bottom: COLLAPSED_HEIGHT + 50, left: 50 },
           animated: true,
@@ -266,6 +458,120 @@ const LocationDetailScreen = ({ navigation, route }) => {
       }, 300);
     }
   };
+
+  const handleGeoFenceEntry = useCallback(
+    async (zone, currentCoords) => {
+      setGeoFenceWarning(GEOFENCE_WARNING_MESSAGE_TEXT);
+
+      const shouldShowRedZoneTravelAlert =
+        isTraveling && isSelectedRouteRed() && isRedZone(zone);
+      const redZoneTravelMessage = zone?.title
+        ? `You are in a red zone (${zone.title}) while following a red route. Recalculate immediately.`
+        : 'You are in a red zone while following a red route. Recalculate immediately.';
+
+      try {
+        await sendGeoFenceWarningNotification(zone, {
+          message: shouldShowRedZoneTravelAlert ? redZoneTravelMessage : undefined,
+        });
+      } catch (notificationError) {
+        console.error('Error sending geo-fence notification:', notificationError);
+      }
+
+      if (shouldShowRedZoneTravelAlert) {
+        Alert.alert('Red zone detected', redZoneTravelMessage);
+      } else {
+        Alert.alert(
+          'High-risk area detected',
+          `${GEOFENCE_WARNING_MESSAGE_TEXT}\nWe suggest recalculating the route.`
+        );
+      }
+
+      const currentDestination = destinationRef.current;
+      const currentRoutes = routeAlternativesRef.current;
+
+      if (
+        !currentDestination ||
+        !Array.isArray(currentRoutes) ||
+        currentRoutes.length === 0 ||
+        isGeoFenceRecalcInFlightRef.current
+      ) {
+        return;
+      }
+
+      isGeoFenceRecalcInFlightRef.current = true;
+      setIsSafetyLoading(true);
+
+      try {
+        const safeRouteResults = await requestSafeRoute({
+          origin_lat: currentCoords.latitude,
+          origin_lng: currentCoords.longitude,
+          destination_lat: currentDestination.latitude,
+          destination_lng: currentDestination.longitude,
+          timestamp: new Date().toISOString(),
+          routes: buildSafeRoutePayloadRoutes(currentRoutes),
+        });
+
+        const recalculatedRoutes = mergeSafeRouteScores(currentRoutes, safeRouteResults);
+        setRouteAlternatives(recalculatedRoutes);
+
+        const nextSelectedIndex = Math.min(
+          selectedRouteIndexRef.current,
+          Math.max(recalculatedRoutes.length - 1, 0)
+        );
+
+        if (recalculatedRoutes[nextSelectedIndex]) {
+          applySelectedRoute(recalculatedRoutes, nextSelectedIndex, selectedTravelModeRef.current);
+        }
+      } catch (safeRouteError) {
+        console.error('Error recalculating safe route after geo-fence hit:', safeRouteError);
+      } finally {
+        isGeoFenceRecalcInFlightRef.current = false;
+        setIsSafetyLoading(false);
+      }
+    },
+    [applySelectedRoute, isSelectedRouteRed, isTraveling]
+  );
+
+  const evaluateGeoFence = useCallback(
+    async (currentCoords) => {
+      const hadActiveZones = activeDangerZoneIdsRef.current.size > 0;
+      const matchedZones = checkGeoFence(currentCoords, dangerZonesRef.current);
+      const nextActiveIds = new Set(matchedZones.map((zone) => zone.id));
+      const newlyEnteredZones = matchedZones.filter(
+        (zone) => !activeDangerZoneIdsRef.current.has(zone.id)
+      );
+
+      activeDangerZoneIdsRef.current = nextActiveIds;
+
+      if (!matchedZones.length) {
+        setGeoFenceWarning(null);
+
+        if (hadActiveZones) {
+          setGeoFenceAlertStatus({
+            active: false,
+            message: GEOFENCE_WARNING_MESSAGE_TEXT,
+          });
+        }
+
+        return;
+      }
+
+      setGeoFenceWarning(GEOFENCE_WARNING_MESSAGE_TEXT);
+
+      if (newlyEnteredZones.length > 0 || !hadActiveZones) {
+        setGeoFenceAlertStatus({
+          active: true,
+          message: GEOFENCE_WARNING_MESSAGE_TEXT,
+        });
+      }
+
+      if (newlyEnteredZones.length > 0) {
+        const prioritizedZone = newlyEnteredZones.find((zone) => isRedZone(zone)) || newlyEnteredZones[0];
+        await handleGeoFenceEntry(prioritizedZone, currentCoords);
+      }
+    },
+    [handleGeoFenceEntry]
+  );
   
   const handleSwapLocations = () => {
     if (!origin || !destination) return;
@@ -283,7 +589,15 @@ const LocationDetailScreen = ({ navigation, route }) => {
       return;
     }
 
+    const selectedRoute = routeAlternatives[selectedRouteIndex];
+    if (!hasExplicitRouteSelection || !selectedRoute) {
+      Alert.alert('Select route first', 'Please select the route you want to follow before starting.');
+      return;
+    }
+
     try {
+      await showDangerousRouteAlert(selectedRoute);
+
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
         Alert.alert('Location permission needed', 'Allow location access to start navigation.');
@@ -311,7 +625,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
 
           setUserLocation(liveLocation);
           setOrigin(createCurrentLocationPoint(position.coords, 0.01));
-          getRoute(position.coords, selectedTravelModeRef.current);
+          evaluateGeoFence(position.coords);
 
           if (mapRef.current) {
             mapRef.current.animateToRegion(liveLocation, 600);
@@ -321,6 +635,32 @@ const LocationDetailScreen = ({ navigation, route }) => {
 
       navigationSubscriptionRef.current = subscription;
       setIsNavigating(true);
+      startTravelSession(destination, {
+        activeRouteIndex: selectedRouteIndex,
+        travelMode: selectedTravelModeRef.current,
+      });
+
+      try {
+        const currentPosition = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+        const matchedZonesOnStart = checkGeoFence(
+          currentPosition.coords,
+          dangerZonesRef.current
+        );
+
+        if (matchedZonesOnStart.length > 0) {
+          const prioritizedZone =
+            matchedZonesOnStart.find((zone) => isRedZone(zone)) || matchedZonesOnStart[0];
+          await handleGeoFenceEntry(prioritizedZone, currentPosition.coords);
+          setGeoFenceAlertStatus({
+            active: true,
+            message: GEOFENCE_WARNING_MESSAGE_TEXT,
+          });
+        }
+      } catch (geoFenceStartError) {
+        console.error('Error checking geo-fence at trip start:', geoFenceStartError);
+      }
     } catch (error) {
       console.error('Error starting in-app navigation:', error);
       Alert.alert('Unable to start navigation', 'Please try again.');
@@ -333,6 +673,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
       navigationSubscriptionRef.current = null;
     }
     setIsNavigating(false);
+    stopTravelSession();
   };
 
   useEffect(() => {
@@ -343,6 +684,64 @@ const LocationDetailScreen = ({ navigation, route }) => {
       }
     };
   }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadDangerZoneData = async () => {
+      try {
+        const zones = await fetchDangerZones();
+        if (isMounted) {
+          setDangerZones(zones);
+        }
+      } catch (error) {
+        console.error('Error fetching danger zones:', error);
+      }
+    };
+
+    loadDangerZoneData();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isNavigating || dangerZones.length === 0) {
+      return undefined;
+    }
+
+    let isActive = true;
+
+    const pollGeoFenceLocation = async () => {
+      try {
+        const { status } = await Location.getForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          return;
+        }
+
+        const position = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+
+        if (!isActive) {
+          return;
+        }
+
+        await evaluateGeoFence(position.coords);
+      } catch (error) {
+        console.error('Error checking geo-fence location:', error);
+      }
+    };
+
+    pollGeoFenceLocation();
+    const intervalId = setInterval(pollGeoFenceLocation, GEO_FENCE_CHECK_INTERVAL);
+
+    return () => {
+      isActive = false;
+      clearInterval(intervalId);
+    };
+  }, [dangerZones.length, evaluateGeoFence, isNavigating]);
   // PanResponder for dragging
   const panResponder = useRef(
     PanResponder.create({
@@ -422,6 +821,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
         };
         setUserLocation(userLoc);
         setOrigin(createCurrentLocationPoint(currentLocation.coords));
+        evaluateGeoFence(currentLocation.coords);
 
         // Get route
         getRoute(currentLocation.coords, selectedTravelModeRef.current);
@@ -438,6 +838,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
         };
         setUserLocation(fallbackRegion);
         setOrigin(createCurrentLocationPoint(fallback));
+        evaluateGeoFence(fallback);
       }
     };
 
@@ -451,7 +852,10 @@ const LocationDetailScreen = ({ navigation, route }) => {
   setRouteInfo(null);
   setRouteAlternatives([]);
   setRouteCoordinates([]);
-  setSelectedRouteIndex(0);
+  setSelectedRouteIndex(
+    isTraveling && Number.isInteger(activeRouteIndex) ? activeRouteIndex : 0
+  );
+  setHasExplicitRouteSelection(isTraveling);
 
   const modeConfig = TRAVEL_MODE_CONFIG[modeKey] || TRAVEL_MODE_CONFIG.drive;
 
@@ -536,11 +940,13 @@ const LocationDetailScreen = ({ navigation, route }) => {
         routeId: index + 1,
       }));
 
-      let routesWithSafety = alternativesWithRouteIds;
+      const alternativesWithFuelSavings = withCalculatedFuelSavings(alternativesWithRouteIds, modeKey);
+
+      let routesWithSafety = alternativesWithFuelSavings;
 
       try {
         setIsSafetyLoading(true);
-        const safetyPayloadRoutes = alternativesWithRouteIds.map((routeItem) => ({
+        const safetyPayloadRoutes = alternativesWithFuelSavings.map((routeItem) => ({
           route_id: routeItem.routeId,
           coordinates: sampleCoordinatesForSafety(routeItem.coordinates).map((point) => ({
             lat: point.latitude,
@@ -564,7 +970,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
           ])
         );
 
-        routesWithSafety = alternativesWithRouteIds.map((routeItem) => {
+        routesWithSafety = alternativesWithFuelSavings.map((routeItem) => {
           const safetyScore = safetyByRouteId.get(routeItem.routeId);
           return {
             ...routeItem,
@@ -581,7 +987,12 @@ const LocationDetailScreen = ({ navigation, route }) => {
       setRouteAlternatives(routesWithSafety);
 
       if (routesWithSafety.length > 0) {
-        applySelectedRoute(routesWithSafety, 0, modeKey);
+        const lockedIndex =
+          isTraveling && Number.isInteger(activeRouteIndex)
+            ? Math.min(activeRouteIndex, Math.max(routesWithSafety.length - 1, 0))
+            : 0;
+
+        applySelectedRoute(routesWithSafety, lockedIndex, modeKey);
       }
     }
   } catch (error) {
@@ -593,7 +1004,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
     if (origin && destination) {
       getRoute(origin, selectedTravelMode);
     }
-  }, [origin, destination, selectedTravelMode]);
+  }, [origin, destination, selectedTravelMode, isNavigating, activeRouteIndex]);
 
   // Bottom sheet animated style
   const sheetHeight = animatedValue;
@@ -601,14 +1012,16 @@ const LocationDetailScreen = ({ navigation, route }) => {
   const getOptionDuration = (modeKey) => {
     if (!routeInfo) return '--';
 
-    const currentModeFactor =
-      TRAVEL_MODE_CONFIG[selectedTravelMode]?.durationFactor ?? TRAVEL_MODE_CONFIG.drive.durationFactor;
-    const targetModeFactor =
-      TRAVEL_MODE_CONFIG[modeKey]?.durationFactor ?? TRAVEL_MODE_CONFIG.drive.durationFactor;
+    // Use estimationFactor (not durationFactor) so cross-profile modes like
+    // drive (OSRM 'driving') and walk (OSRM 'foot') produce different estimates.
+    const currentEstFactor =
+      TRAVEL_MODE_CONFIG[selectedTravelMode]?.estimationFactor ?? 1;
+    const targetEstFactor =
+      TRAVEL_MODE_CONFIG[modeKey]?.estimationFactor ?? 1;
 
     const adjustedMinutes = Math.max(
       1,
-      Math.round(routeInfo.durationMinutes * (targetModeFactor / currentModeFactor))
+      Math.round(routeInfo.durationMinutes * (targetEstFactor / currentEstFactor))
     );
 
     return formatDuration(adjustedMinutes);
@@ -624,8 +1037,24 @@ const LocationDetailScreen = ({ navigation, route }) => {
 
   const selectedModeConfig = TRAVEL_MODE_CONFIG[selectedTravelMode] || TRAVEL_MODE_CONFIG.drive;
 
+  const handleTravelModeSelect = (modeKey) => {
+    if (isNavigating) {
+      Alert.alert('Stop navigation first', 'Stop current navigation before switching travel mode.');
+      return;
+    }
+
+    setSelectedTravelMode(modeKey);
+  };
+
   const handleAlternativeSelect = (index) => {
     if (!routeAlternatives.length) return;
+
+    if (isNavigating) {
+      Alert.alert('Stop navigation first', 'Stop current navigation before switching routes.');
+      return;
+    }
+
+    setHasExplicitRouteSelection(true);
     applySelectedRoute(routeAlternatives, index, selectedTravelMode);
   };
 
@@ -666,6 +1095,18 @@ const LocationDetailScreen = ({ navigation, route }) => {
       return aSelected - bSelected;
     });
 
+  const mapVisibleRouteAlternatives = isNavigating
+    ? orderedRouteAlternatives.filter(({ index }) => index === selectedRouteIndex)
+    : orderedRouteAlternatives;
+
+  const originDisplayName = origin?.name || 'Your location';
+  const originDisplayAddress = origin?.address || 'Current position';
+  const destinationDisplayName = destination?.name || 'Selected destination';
+  const destinationDisplayAddress = destination?.address || 'Destination location';
+  const shouldShowOriginMarker = Boolean(origin) && !areCoordinatesClose(origin, userLocation);
+  const shouldShowDestinationMarker =
+    Boolean(destination) && !areCoordinatesClose(destination, origin);
+
   return (
     <SafeAreaView style={styles.container}>
       {userLocation && destination && (
@@ -676,8 +1117,8 @@ const LocationDetailScreen = ({ navigation, route }) => {
                 <View style={styles.locationRowLeft}>
                   <View style={styles.originDot} />
                   <View style={styles.locationMeta}>
-                    <Text style={styles.locationRowLabel}>Your location</Text>
-                    <Text style={styles.locationRowSubtext}>Current position</Text>
+                    <Text style={styles.locationRowLabel}>{originDisplayName}</Text>
+                    <Text style={styles.locationRowSubtext}>{originDisplayAddress}</Text>
                   </View>
                 </View>
               </View>
@@ -688,9 +1129,9 @@ const LocationDetailScreen = ({ navigation, route }) => {
                 <View style={styles.locationRowLeft}>
                   <MaterialIcons name="location-on" size={22} color="#FF3B30" />
                   <View style={styles.locationMeta}>
-                    <Text style={styles.locationRowLabel}>{destination.name}</Text>
+                    <Text style={styles.locationRowLabel}>{destinationDisplayName}</Text>
                     <Text style={styles.locationRowSubtext} numberOfLines={1}>
-                      {destination.address}
+                      {destinationDisplayAddress}
                     </Text>
                   </View>
                 </View>
@@ -729,14 +1170,31 @@ const LocationDetailScreen = ({ navigation, route }) => {
             </View>
           </Marker>
 
+          {/* Route Origin Marker (when swapped or custom origin differs from live location) */}
+          {shouldShowOriginMarker && (
+            <Marker
+              coordinate={{
+                latitude: origin.latitude,
+                longitude: origin.longitude,
+              }}
+              title={originDisplayName}
+              description={originDisplayAddress}
+            >
+              <View style={styles.originLocationMarker}>
+                <MaterialIcons name="trip-origin" size={22} color={theme.colors.primary} />
+              </View>
+            </Marker>
+          )}
+
           {/* Selected Location Marker */}
-          {destination && (
+          {shouldShowDestinationMarker && (
             <Marker
               coordinate={{
                 latitude: destination.latitude,
                 longitude: destination.longitude,
               }}
-              title={destination.name}
+              title={destinationDisplayName}
+              description={destinationDisplayAddress}
             >
               <View style={styles.locationMarker}>
                 <MaterialIcons name="location-on" size={28} color="#FF3B30" />
@@ -745,7 +1203,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
           )}
 
           {/* Route Polylines */}
-          {orderedRouteAlternatives.map(({ routeItem, index }) => (
+          {mapVisibleRouteAlternatives.map(({ routeItem, index }) => (
             <Polyline
               key={routeItem.id}
               coordinates={routeItem.coordinates}
@@ -762,7 +1220,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
             />
           ))}
 
-          {routeAlternatives.map((routeItem) => {
+          {mapVisibleRouteAlternatives.map(({ routeItem }) => {
             const circleStyle = getSafetyCircleStyle(routeItem.safetyScore);
             const sampledCirclePoints = sampleCoordinatesForMapCircles(routeItem.coordinates);
 
@@ -780,6 +1238,44 @@ const LocationDetailScreen = ({ navigation, route }) => {
         </MapView>
       ) : (
         <View style={styles.loadingContainer} />
+      )}
+
+      <View style={styles.safetyLegendCard} pointerEvents="none">
+        <View style={styles.safetyLegendRow}>
+          <View style={[styles.safetyLegendDot, { backgroundColor: '#2FAD65' }]} />
+          <Text style={styles.safetyLegendText}>Safe ({'>'}70)</Text>
+        </View>
+        <View style={styles.safetyLegendRow}>
+          <View style={[styles.safetyLegendDot, { backgroundColor: '#F39C12' }]} />
+          <Text style={styles.safetyLegendText}>Moderate (40–70)</Text>
+        </View>
+        <View style={styles.safetyLegendRow}>
+          <View style={[styles.safetyLegendDot, { backgroundColor: '#E74C3C' }]} />
+          <Text style={styles.safetyLegendText}>Unsafe ({'<'}40)</Text>
+        </View>
+      </View>
+
+      {isSafetyLoading && (
+        <View style={styles.safetyLoadingBanner} pointerEvents="none">
+          <ActivityIndicator size="small" color={theme.colors.primary} />
+          <Text style={styles.safetyLoadingBannerText}>Analyzing route safety...</Text>
+        </View>
+      )}
+
+      {geoFenceWarning && (
+        <View
+          style={[
+            styles.geoFenceAlertBanner,
+            isSafetyLoading && styles.geoFenceAlertBannerOffset,
+          ]}
+          pointerEvents="none"
+        >
+          <MaterialIcons name="warning-amber" size={18} color="#B42318" />
+          <View style={styles.geoFenceAlertContent}>
+            <Text style={styles.geoFenceAlertText}>{geoFenceWarning}</Text>
+            <Text style={styles.geoFenceAlertSubtext}>Suggested action: recalculate route.</Text>
+          </View>
+        </View>
       )}
 
       {/* Draggable Bottom Sheet */}
@@ -828,7 +1324,7 @@ const LocationDetailScreen = ({ navigation, route }) => {
                       styles.modeOption,
                       option.active && styles.modeOptionActive,
                     ]}
-                    onPress={() => setSelectedTravelMode(option.key)}
+                    onPress={() => handleTravelModeSelect(option.key)}
                   >
                     <MaterialIcons
                       name={option.icon}
@@ -857,9 +1353,6 @@ const LocationDetailScreen = ({ navigation, route }) => {
             </View>
 
             <View style={styles.routeCard}>
-              {isSafetyLoading && (
-                <Text style={styles.safetyLoadingText}>Analyzing route safety...</Text>
-              )}
               <View style={styles.routeBadgeRow}>
                 <View style={[styles.modePill, styles.modePillActive]}>
                   <MaterialIcons
@@ -938,6 +1431,14 @@ const LocationDetailScreen = ({ navigation, route }) => {
                       >
                         {`${Math.max(1, Math.round(routeItem.duration / 60))} min • ${(routeItem.distance / 1000).toFixed(1)} km`}
                       </Text>
+                      <Text
+                        style={[
+                          styles.routeChipSafety,
+                          { color: getSafetyScoreTextColor(routeItem.safetyScore) },
+                        ]}
+                      >
+                        {getSafetyScoreText(routeItem.safetyScore)}
+                      </Text>
                     </TouchableOpacity>
                   ))}
                 </ScrollView>
@@ -962,11 +1463,24 @@ const LocationDetailScreen = ({ navigation, route }) => {
 
               <View style={styles.routeActionsRow}>
                 <TouchableOpacity
-                  style={[styles.routeActionButton, styles.routeActionPrimary]}
+                  style={[
+                    styles.routeActionButton,
+                    styles.routeActionPrimary,
+                    !isNavigating && !hasExplicitRouteSelection && styles.routeActionPrimaryDisabled,
+                  ]}
                   onPress={isNavigating ? handleStopNavigation : handleStartNavigation}
+                  disabled={!isNavigating && !hasExplicitRouteSelection}
                 >
                   <Text style={styles.routeActionTextPrimary}>{isNavigating ? 'Stop' : 'Start'}</Text>
                 </TouchableOpacity>
+                {isNavigating && (
+                  <TouchableOpacity
+                    style={[styles.routeActionButton, styles.routeActionSecondary]}
+                    onPress={() => navigation.goBack()}
+                  >
+                    <Text style={styles.routeActionTextSecondary}>Back</Text>
+                  </TouchableOpacity>
+                )}
                 <TouchableOpacity
                   style={[styles.routeActionButton, styles.routeActionSecondary]}
                   onPress={handleDebugRouteData}
@@ -1018,6 +1532,15 @@ const styles = StyleSheet.create({
   locationMarker: {
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  originLocationMarker: {
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 4,
+    borderWidth: 1,
+    borderColor: '#D8D8D8',
   },
   bottomSheet: {
     position: 'absolute',
@@ -1175,12 +1698,6 @@ const styles = StyleSheet.create({
     color: '#6A6A6A',
     marginBottom: 14,
   },
-  safetyLoadingText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: theme.colors.text,
-    marginBottom: 10,
-  },
   routeSafetyText: {
     fontSize: 13,
     fontWeight: '600',
@@ -1222,6 +1739,11 @@ const styles = StyleSheet.create({
   routeChipMeta: {
     fontSize: 12,
     color: '#666',
+    marginTop: 2,
+  },
+  routeChipSafety: {
+    fontSize: 12,
+    fontWeight: '600',
     marginTop: 2,
   },
   routeChipMetaActive: {
@@ -1274,6 +1796,9 @@ const styles = StyleSheet.create({
   },
   routeActionPrimary: {
     backgroundColor: theme.colors.primary,
+  },
+  routeActionPrimaryDisabled: {
+    opacity: 0.5,
   },
   routeActionSecondary: {
     borderWidth: 1,
@@ -1350,6 +1875,95 @@ const styles = StyleSheet.create({
   locationCardAction: {
     padding: 8,
     marginLeft: 10,
+  },
+  safetyLegendCard: {
+    position: 'absolute',
+    top: 88,
+    right: 16,
+    backgroundColor: '#FFF',
+    borderRadius: 12,
+    padding: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    elevation: 4,
+    zIndex: 160,
+  },
+  safetyLegendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 1,
+  },
+  safetyLegendDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 6,
+  },
+  safetyLegendText: {
+    fontSize: 11,
+    color: '#444',
+  },
+  safetyLoadingBanner: {
+    position: 'absolute',
+    top: 12,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFF',
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    elevation: 4,
+    zIndex: 160,
+  },
+  safetyLoadingBannerText: {
+    marginLeft: 8,
+    fontSize: 12,
+    fontWeight: '600',
+    color: theme.colors.text,
+  },
+  geoFenceAlertBanner: {
+    position: 'absolute',
+    top: 56,
+    left: 16,
+    right: 16,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: '#FEECEC',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: '#F7C9C5',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 4,
+    elevation: 4,
+    zIndex: 160,
+  },
+  geoFenceAlertBannerOffset: {
+    top: 102,
+  },
+  geoFenceAlertContent: {
+    flex: 1,
+    marginLeft: 8,
+  },
+  geoFenceAlertText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#B42318',
+  },
+  geoFenceAlertSubtext: {
+    fontSize: 12,
+    color: '#7A271A',
+    marginTop: 2,
   },
 });
 

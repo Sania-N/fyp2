@@ -1,6 +1,6 @@
 // App.js
-import React from 'react';
-import { NavigationContainer } from '@react-navigation/native';
+import React, { useCallback, useEffect, useState } from 'react';
+import { NavigationContainer, useNavigationContainerRef } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
@@ -24,6 +24,17 @@ import MenuScreen from './screens/MenuScreen';
 import ProfileScreen from './screens/ProfileScreen';
 import RecordingsHistoryScreen from './screens/RecordingsHistoryScreen';
 import ContactsScreen from './screens/ContactsScreen';
+import AlertsScreen from './screens/AlertsScreen';
+import TravelSessionWidget from './components/TravelSessionWidget';
+import { TravelSessionProvider, useTravelSession } from './context/TravelSessionContext';
+import { DangerAlertProvider } from './context/DangerAlertContext';
+import DangerPopupModal from './components/DangerPopupModal';
+import {
+  attachNotificationListeners,
+  detachNotificationListeners,
+  initializeNotificationHandling,
+  registerForPushNotifications,
+} from './services/notificationsService';
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
@@ -82,8 +93,24 @@ function MainTabs() {
 // ---------------------------
 // App Container
 // ---------------------------
-export default function App() {
+function AppNavigator() {
   const user = useAuth();  // <--- Now everything depends on this
+  const navigationRef = useNavigationContainerRef();
+  const [currentRouteName, setCurrentRouteName] = useState(null);
+  const { isTraveling, destination } = useTravelSession();
+
+  const handleNavigateToActiveTrip = useCallback(() => {
+    if (!destination) return;
+
+    navigationRef.navigate('LocationDetail', {
+      location: destination,
+    });
+  }, [destination, navigationRef]);
+
+  const handleNavigationStateChange = useCallback(() => {
+    const currentRoute = navigationRef.getCurrentRoute();
+    setCurrentRouteName(currentRoute?.name || null);
+  }, [navigationRef]);
 
   if (user === undefined) {
     return (
@@ -94,7 +121,11 @@ export default function App() {
   }
 
   return (
-    <NavigationContainer>
+    <NavigationContainer
+      ref={navigationRef}
+      onReady={handleNavigationStateChange}
+      onStateChange={handleNavigationStateChange}
+    >
       <Stack.Navigator screenOptions={{ headerShown: false }}>
 
         {/* ------------------- */}
@@ -110,6 +141,7 @@ export default function App() {
             <Stack.Screen name="ProfileScreen" component={ProfileScreen} />
             <Stack.Screen name="RecordingsHistory" component={RecordingsHistoryScreen} />
             <Stack.Screen name="ContactsScreen" component={ContactsScreen} />
+            <Stack.Screen name="AlertsScreen" component={AlertsScreen} />
           </>
         ) : (
           <>
@@ -123,6 +155,42 @@ export default function App() {
         )}
 
       </Stack.Navigator>
+
+      {isTraveling && currentRouteName !== 'LocationDetail' && (
+        <TravelSessionWidget onPress={handleNavigateToActiveTrip} />
+      )}
     </NavigationContainer>
+  );
+}
+
+export default function App() {
+  useEffect(() => {
+    initializeNotificationHandling();
+
+    registerForPushNotifications().catch((error) => {
+      console.error('Push notification registration failed:', error);
+    });
+
+    attachNotificationListeners({
+      onNotificationReceived: (notification) => {
+        console.log('Foreground notification received:', notification?.request?.content?.data || {});
+      },
+      onNotificationResponse: (response) => {
+        console.log('Notification opened from background/quit:', response?.notification?.request?.content?.data || {});
+      },
+    });
+
+    return () => {
+      detachNotificationListeners();
+    };
+  }, []);
+
+  return (
+    <TravelSessionProvider>
+      <DangerAlertProvider>
+        <AppNavigator />
+        <DangerPopupModal />
+      </DangerAlertProvider>
+    </TravelSessionProvider>
   );
 }
