@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   Alert,
 } from "react-native";
+import { doc, updateDoc } from "firebase/firestore";
 import { LinearGradient } from "expo-linear-gradient";
 import { Audio } from "expo-av";
 import { CameraView } from "expo-camera";
@@ -19,6 +20,7 @@ import { useNavigation } from "@react-navigation/native";
 import { useAuth } from "../useAuth";
 import { uploadRecording } from "../services/recordingsService";
 import { requestCameraPermission } from "../services/cameraService";
+import { db } from "../firebase";
 import { useKeepAwake } from "expo-keep-awake";
 import { analyzeUserDangerLevel, isDangerRisk } from "../services/dangerDetectionService";
 import { useDangerAlert } from "../context/DangerAlertContext";
@@ -164,14 +166,21 @@ export default function RecordScreen() {
         recordingTime
       );
 
-      Alert.alert("Success", "Recording uploaded with images.");
+      Alert.alert(
+        "Success",
+        uploadResult?.emotion
+          ? `Recording saved. ML result: ${uploadResult.emotion}`
+          : "Recording saved. ML analysis will update when the backend is reachable."
+      );
       setFrontImageUri(null);
       setBackImageUri(null);
       recordingRef.current = null;
 
       // ⚡ DANGER DETECTION FLOW
       try {
-        if (uploadResult && uploadResult.confidence) {
+        const immediateThreat = Boolean(uploadResult?.panic);
+
+        if (uploadResult && uploadResult.confidence != null) {
           console.log(
             `📊 Analyzing danger level... (emotion: ${uploadResult.emotion}, confidence: ${uploadResult.confidence})`
           );
@@ -180,15 +189,23 @@ export default function RecordScreen() {
           const dangerAnalysis = await analyzeUserDangerLevel(uploadResult.confidence);
           console.log(`🔍 Danger analysis: ${dangerAnalysis.risk_level}`);
 
+          if (uploadResult.recordingId) {
+            await updateDoc(doc(db, "recordings", uploadResult.recordingId), {
+              risk_level: dangerAnalysis.risk_level,
+              threat_detected: immediateThreat || isDangerRisk(dangerAnalysis.risk_level),
+            });
+          }
+
           // If DANGER detected, show popup
-          if (isDangerRisk(dangerAnalysis.risk_level)) {
+          if (immediateThreat || isDangerRisk(dangerAnalysis.risk_level)) {
             console.log("🚨 DANGER DETECTED! Showing safety popup...");
             await addGeoFenceAlertHistoryItem({
-              message: `Danger detected: emotion=${uploadResult.emotion || "unknown"}, confidence=${Number(uploadResult.confidence).toFixed(3)}, risk=${dangerAnalysis.risk_level}. Safety popup shown with 60s timer.`,
+              message: `Danger detected: emotion=${uploadResult.emotion || "unknown"}, confidence=${Number(uploadResult.confidence).toFixed(3)}, panic=${immediateThreat}, risk=${dangerAnalysis.risk_level}. Safety popup shown with 60s timer.`,
               eventType: "DANGER_DETECTED",
               details: {
                 emotion: uploadResult.emotion || "unknown",
                 emotionConfidence: Number(uploadResult.confidence),
+                panic: immediateThreat,
                 riskLevel: dangerAnalysis.risk_level,
                 motion: dangerAnalysis?.motion_used,
                 heartRate: dangerAnalysis?.heart_rate_used,
@@ -197,11 +214,12 @@ export default function RecordScreen() {
             showDangerAlert();
           } else {
             await addGeoFenceAlertHistoryItem({
-              message: `No immediate danger: emotion=${uploadResult.emotion || "unknown"}, confidence=${Number(uploadResult.confidence).toFixed(3)}, risk=${dangerAnalysis.risk_level}.`,
+              message: `No immediate danger: emotion=${uploadResult.emotion || "unknown"}, confidence=${Number(uploadResult.confidence).toFixed(3)}, panic=${immediateThreat}, risk=${dangerAnalysis.risk_level}.`,
               eventType: "NO_IMMEDIATE_DANGER",
               details: {
                 emotion: uploadResult.emotion || "unknown",
                 emotionConfidence: Number(uploadResult.confidence),
+                panic: immediateThreat,
                 riskLevel: dangerAnalysis.risk_level,
                 motion: dangerAnalysis?.motion_used,
                 heartRate: dangerAnalysis?.heart_rate_used,
@@ -215,7 +233,7 @@ export default function RecordScreen() {
       }
     } catch (err) {
       console.log("stopRecording error:", err);
-      Alert.alert("Failed", "Audio upload failed.");
+      Alert.alert("Failed", err?.message || "Could not finish recording.");
     } finally {
       setUploading(false);
     }

@@ -2,11 +2,11 @@
   "expo": {
     "name": "my-app",
     "slug": "my-app",
+    "sdkVersion": "54.0.0",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -25,7 +25,18 @@
           "contactsPermission": "Allow $(PRODUCT_NAME) to access your contacts to add trusted emergency contacts."
         }
       ],
-      "expo-notifications"
+      "expo-notifications",
+      "expo-font",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "manifestApplicationAttributes": {
+              "android:usesCleartextTraffic": "true"
+            }
+          }
+        }
+      ]
     ],
     "ios": {
       "supportsTablet": true,
@@ -34,8 +45,6 @@
         "NSMicrophoneUsageDescription": "This app needs microphone access to record audio.",
         "NSContactsUsageDescription": "This app needs access to your contacts to add trusted emergency contacts."
       }
-
-      
     },
     "android": {
       "adaptiveIcon": {
@@ -46,12 +55,22 @@
         "POST_NOTIFICATIONS",
         "CAMERA",
         "RECORD_AUDIO",
-        "READ_CONTACTS"
+        "READ_CONTACTS",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_CONTACTS",
+        "android.permission.WRITE_CONTACTS"
       ],
-      "edgeToEdgeEnabled": true
+      "package": "com.anonymous.myapp"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "1c896049-cda2-43f4-85a2-84b49dc0d5a5"
+      }
+    },
+    "owner": "sania_001"
   }
 }

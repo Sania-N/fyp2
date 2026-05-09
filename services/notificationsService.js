@@ -1,3 +1,4 @@
+import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 import * as Notifications from 'expo-notifications';
 
@@ -13,6 +14,11 @@ const formatTimestamp = (timestamp = new Date().toISOString()) => {
 };
 
 const buildNotificationBody = (message, timestamp) => `${message}\nTime: ${formatTimestamp(timestamp)}`;
+
+const isExpoGoClient = () =>
+  Constants?.executionEnvironment === 'storeClient' || Constants?.appOwnership === 'expo';
+
+export const supportsRemotePushNotifications = () => !isExpoGoClient();
 
 const scheduleLocalNotification = async ({ title, message, timestamp, type }) => {
   const resolvedTimestamp = timestamp || new Date().toISOString();
@@ -41,6 +47,12 @@ const scheduleLocalNotification = async ({ title, message, timestamp, type }) =>
 };
 
 export const initializeNotificationHandling = () => {
+  // Skip notification handler setup in Expo Go to avoid remote push notification errors in SDK 53+
+  if (isExpoGoClient()) {
+    console.info('Skipping notification handler setup in Expo Go.');
+    return;
+  }
+
   Notifications.setNotificationHandler({
     handleNotification: async () => ({
       shouldShowAlert: true,
@@ -53,6 +65,16 @@ export const initializeNotificationHandling = () => {
 };
 
 export const registerForPushNotifications = async () => {
+  if (!supportsRemotePushNotifications()) {
+    console.info('Skipping remote push registration because this runtime is Expo Go. Use a development build for Expo push tokens.');
+    return {
+      granted: false,
+      pushToken: null,
+      skipped: true,
+      reason: 'Expo Go does not support remote push notifications. Use a development build.',
+    };
+  }
+
   let finalStatus;
 
   const { status: existingStatus } = await Notifications.getPermissionsAsync();
@@ -159,6 +181,12 @@ export const attachNotificationListeners = ({
   onNotificationReceived,
   onNotificationResponse,
 } = {}) => {
+  // Skip attaching listeners in Expo Go to avoid remote push notification errors in SDK 53+
+  if (isExpoGoClient()) {
+    console.info('Skipping notification listeners in Expo Go.');
+    return;
+  }
+
   notificationReceivedSubscription = Notifications.addNotificationReceivedListener((notification) => {
     if (typeof onNotificationReceived === 'function') {
       onNotificationReceived(notification);

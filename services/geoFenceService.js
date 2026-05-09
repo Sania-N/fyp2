@@ -2,11 +2,12 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { API_BASE_URL } from '../api';
 import {
   registerForPushNotifications,
+  supportsRemotePushNotifications,
   sendGeoFenceWarning,
 } from './notificationsService';
 
-const FALLBACK_DANGER_ZONES_ENDPOINT = 'http://192.168.100.11:8000/danger-zones';
-const FALLBACK_SAFE_ROUTE_ENDPOINT = 'http://192.168.100.11:8000/safe-route';
+const FALLBACK_DANGER_ZONES_ENDPOINT = `${API_BASE_URL}/danger-zones`;
+const FALLBACK_SAFE_ROUTE_ENDPOINT = `${API_BASE_URL}/safe-route`;
 const GEOFENCE_NOTIFICATION_MESSAGE = 'Warning: You are entering a high-risk area.';
 const EARTH_RADIUS_METERS = 6371000;
 const GEOFENCE_ALERT_STORAGE_KEY = '@geofence_active_alert';
@@ -524,6 +525,10 @@ export const checkGeoFence = (userLocation, dangerZones = []) => {
 };
 
 export const registerGeoFenceNotificationsAsync = async () => {
+  if (!supportsRemotePushNotifications()) {
+    return false;
+  }
+
   const registration = await registerForPushNotifications();
   return Boolean(registration?.granted);
 };

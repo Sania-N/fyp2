@@ -16,6 +16,16 @@ import {
   updateDoc,
 } from "firebase/firestore";
 import { API_BASE_URL } from "../api";
+import { analyzeUserDangerLevel } from "./dangerDetectionService";
+
+const getSupabaseClient = () => {
+  if (!supabase) {
+    throw new Error('Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY to enable recording uploads.');
+  }
+
+  return supabase;
+};
+
 // Helper to decode base64 to Uint8Array
 function decode(base64) {
   const binaryString = atob(base64);
@@ -31,6 +41,7 @@ function decode(base64) {
 ============================================================ */
 export async function uploadImages(userUid, frontImageUri, backImageUri, timestamp) {
   try {
+    const supabaseClient = getSupabaseClient();
     const urls = {};
 
     // Only upload back image
@@ -43,11 +54,11 @@ export async function uploadImages(userUid, frontImageUri, backImageUri, timesta
         encoding: FileSystem.EncodingType.Base64,
       });
       
-      const { error } = await supabase.storage.from("recordings").upload(path, decode(base64Data), {
+      const { error } = await supabaseClient.storage.from("recordings").upload(path, decode(base64Data), {
         contentType: "image/jpeg",
       });
       if (error) throw error;
-      const { data } = supabase.storage.from("recordings").getPublicUrl(path);
+      const { data } = supabaseClient.storage.from("recordings").getPublicUrl(path);
       urls.back_image_url = data?.publicUrl || null;
       console.log("📸 Back image uploaded:", urls.back_image_url);
     }
@@ -67,32 +78,48 @@ export async function uploadRecording(
   localUri,
   frontImageUri,
   backImageUri,
-  duration = 0
+  duration = 0,
+  esp32Telemetry = null  // ✅ NEW parameter for hardware data
 ) {
   try {
+    console.log('🚀 uploadRecording START:', { 
+      userUid, 
+      localUri, 
+      duration,
+      esp32Available: !!esp32Telemetry
+    });
+    const supabaseClient = getSupabaseClient();
     const ts = Date.now();
     const filename = `${userUid}_${ts}.m4a`;
     const storagePath = `recordings/${userUid}/${ts}/audio/${filename}`;
 
+    console.log('📝 Reading audio file:', localUri);
     const base64Audio = await FileSystem.readAsStringAsync(localUri, {
       encoding: FileSystem.EncodingType.Base64,
     });
+    console.log('✅ Audio file read. Size:', base64Audio.length, 'bytes');
 
-    await supabase.storage
+    console.log('📤 Uploading to Supabase:', storagePath);
+    await supabaseClient.storage
       .from("recordings")
       .upload(storagePath, decode(base64Audio), {
         contentType: "audio/m4a",
       });
+    console.log('✅ Audio uploaded to Supabase');
 
-    const { data } = supabase.storage
+    const { data } = supabaseClient.storage
       .from("recordings")
       .getPublicUrl(storagePath);
 
     const audioUrl = data.publicUrl;
+    console.log('🔗 Audio URL:', audioUrl);
 
+    console.log('📸 Uploading images...');
     const images = await uploadImages(userUid, frontImageUri, backImageUri, ts);
+    console.log('✅ Images uploaded:', images);
 
     // 1️⃣ Create Firestore doc first
+    console.log('📝 Creating Firestore document...');
     const docRef = await addDoc(collection(db, "recordings"), {
       user_uid: userUid,
       filename,
@@ -104,30 +131,199 @@ export async function uploadRecording(
       emotion: null,
       confidence: null,
       panic: false,
+      threat_level: null,  // ✅ NEW
+      hardware_context: esp32Telemetry || null,  // ✅ NEW
     });
+    console.log('✅ Firestore doc created:', docRef.id);
 
-    // 2️⃣ CALL FASTAPI
-    const result = await detectEmotion(audioUrl);
+    // 2️⃣ CALL FASTAPI WITH HARDWARE CONTEXT
+    console.log('🧠 Calling detectEmotion with ESP32 context:', {
+      audioUrl,
+      esp32Available: !!esp32Telemetry
+    });
+    let result = null;
+    try {
+      result = await detectEmotion(audioUrl, esp32Telemetry);  // ✅ Pass telemetry
+      console.log('✅ ML result received:', result);
+    } catch (mlError) {
+      console.warn('⚠️ ML detection failed, keeping recording saved:', mlError.message || mlError);
+    }
 
     // 3️⃣ UPDATE FIRESTORE WITH ML RESULT
-    await updateDoc(doc(db, "recordings", docRef.id), {
-      emotion: result.emotion,
-      confidence: result.confidence,
-      panic: result.panic,
-    });
+    if (result) {
+      console.log('📤 Updating Firestore with ML results...');
+      await updateDoc(doc(db, "recordings", docRef.id), {
+        emotion: result.emotion,
+        confidence: result.confidence,
+        panic: result.panic,
+        threat_level: result.risk_level || null,  // ✅ NEW
+      });
+      console.log('✅ Firestore updated successfully');
+    }
 
+    console.log('🎉 uploadRecording COMPLETE');
     return {
+      recordingId: docRef.id,
       audioUrl,
-      emotion: result.emotion,
-      confidence: result.confidence,
-      panic: result.panic,
+      emotion: result?.emotion ?? null,
+      confidence: result?.confidence ?? null,
+      panic: result?.panic ?? false,
+      threatLevel: result?.risk_level ?? null,  // ✅ NEW
+      hardwareContext: esp32Telemetry,  // ✅ NEW
     };
   } catch (err) {
-    console.error("uploadRecording failed", err);
+    console.error("❌ uploadRecording FAILED:", err.message || err);
+    console.error("Stack:", err.stack);
     throw err;
   }
 }
 
+/* ============================================================
+  UPLOAD A PRE-CREATED AUDIO FILE (WAV/M4A) + SAVE METADATA
+  Used by ESP32 WebSocket capture workflow which writes a WAV to disk
+============================================================ */
+export async function uploadRecordingFile(
+  userUid,
+  localUri,
+  filename,
+  duration = 0,
+  esp32Telemetry = null,
+  frontImageUri = null,
+  backImageUri = null
+) {
+  try {
+    console.log('🚀 uploadRecordingFile START:', { userUid, localUri, filename, duration });
+    const supabaseClient = getSupabaseClient();
+    const ts = Date.now();
+    const storagePath = `recordings/${userUid}/${ts}/audio/${filename}`;
+
+    console.log('📝 Reading audio file (file):', localUri);
+    const base64Audio = await FileSystem.readAsStringAsync(localUri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+
+    console.log('📤 Uploading to Supabase (file):', storagePath);
+    await supabaseClient.storage
+      .from('recordings')
+      .upload(storagePath, decode(base64Audio), {
+        contentType: filename.toLowerCase().endsWith('.wav') ? 'audio/wav' : 'audio/m4a',
+      });
+
+    const { data } = supabaseClient.storage
+      .from('recordings')
+      .getPublicUrl(storagePath);
+
+    const audioUrl = data.publicUrl;
+    console.log('🔗 Audio URL (file):', audioUrl);
+
+    const images = await uploadImages(userUid, frontImageUri, backImageUri, ts);
+
+    const docRef = await addDoc(collection(db, 'recordings'), {
+      user_uid: userUid,
+      filename,
+      audio_url: audioUrl,
+      duration,
+      front_image_url: images.front_image_url || null,
+      back_image_url: images.back_image_url || null,
+      created_at: serverTimestamp(),
+      emotion: null,
+      confidence: null,
+      panic: false,
+      threat_level: null,
+      hardware_context: esp32Telemetry || null,
+    });
+
+    let result = null;
+    try {
+      result = await detectEmotion(audioUrl, esp32Telemetry);
+    } catch (mlError) {
+      console.warn('⚠️ ML detection failed (file upload):', mlError.message || mlError);
+    }
+
+    if (result) {
+      await updateDoc(doc(db, 'recordings', docRef.id), {
+        emotion: result.emotion,
+        confidence: result.confidence,
+        panic: result.panic,
+        threat_level: result.risk_level || null,
+      });
+    }
+
+    return {
+      recordingId: docRef.id,
+      audioUrl,
+      emotion: result?.emotion ?? null,
+      confidence: result?.confidence ?? null,
+      panic: result?.panic ?? false,
+      threatLevel: result?.risk_level ?? null,
+      hardwareContext: esp32Telemetry,
+    };
+  } catch (err) {
+    console.error('❌ uploadRecordingFile FAILED:', err.message || err);
+    throw err;
+  }
+}
+
+/**
+ * 🧠 Call emotion detection + threat analysis with hardware fusion
+ * @param {string} audioUrl - URL to audio file
+ * @param {object} esp32Telemetry - Hardware sensor data (heart rate, motion, audio level)
+ * @returns {Promise<{emotion, confidence, panic, risk_level}>}
+ */
+export async function detectEmotion(audioUrl, esp32Telemetry = null) {
+  try {
+    console.log('🧠 [detectEmotion] Starting with:', { audioUrl, esp32Telemetry: !!esp32Telemetry });
+
+    // Step 1: Get emotion from audio
+    console.log('📊 [detectEmotion] Calling /predict endpoint...');
+    const emotionResponse = await fetch(`${API_BASE_URL}/predict`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio_url: audioUrl }),
+    });
+
+    if (!emotionResponse.ok) {
+      throw new Error(`Emotion detection failed: ${emotionResponse.status}`);
+    }
+
+    const emotionData = await emotionResponse.json();
+    console.log('📊 [detectEmotion] Audio emotion result:', emotionData);
+
+    const emotionConfidence = emotionData.confidence;
+
+    // Step 2: Get threat level using emotion + hardware data
+    console.log('🚨 [detectEmotion] Calling threat analysis with hardware fusion...');
+    let threatData = null;
+    
+    if (esp32Telemetry) {
+      console.log('✅ [detectEmotion] Using REAL ESP32 hardware data');
+      threatData = await analyzeUserDangerLevel(
+        emotionConfidence, 
+        esp32Telemetry  // ✅ Pass real sensor data
+      );
+    } else {
+      console.log('⚠️ [detectEmotion] No ESP32 data, using fallback mode');
+      threatData = await analyzeUserDangerLevel(emotionConfidence);  // Fallback
+    }
+
+    console.log('🚨 [detectEmotion] Threat analysis result:', threatData);
+
+    // Combine results
+    const finalResult = {
+      ...emotionData,
+      ...threatData,
+      hardware_data_used: !!esp32Telemetry,
+      sensor_context: esp32Telemetry || null,
+    };
+
+    console.log('✅ [detectEmotion] Final combined result:', finalResult);
+    return finalResult;
+
+  } catch (error) {
+    console.error('❌ [detectEmotion] Error:', error);
+    throw error;
+  }
+}
 
 /* ============================================================
   FETCH + STREAM
@@ -149,6 +345,7 @@ export function listenUserRecordings(userUid, onUpdate) {
 ============================================================ */
 export async function deleteRecording(id, filename, audioURL, frontURL, backURL) {
   try {
+    const supabaseClient = getSupabaseClient();
     const user = filename.split("_")[0];
     const ts = filename.split("_")[1].split(".")[0];
     const base = `recordings/${user}/${ts}/`;
@@ -159,7 +356,7 @@ export async function deleteRecording(id, filename, audioURL, frontURL, backURL)
     if (backURL) files.push(`${base}images/${backURL.split("/").pop()}`);
 
     // supabase remove expects array of paths
-    await supabase.storage.from("recordings").remove(files);
+    await supabaseClient.storage.from("recordings").remove(files);
 
     // delete firestore doc
     await deleteDoc(doc(db, "recordings", id));
@@ -174,18 +371,4 @@ export async function deleteRecording(id, filename, audioURL, frontURL, backURL)
 ============================================================ */
 export async function renameRecording(id, newName) {
   await updateDoc(doc(db, "recordings", id), { filename: newName });
-}
-async function detectEmotion(audioUrl) {
-  const res = await fetch(`${API_BASE_URL}/predict`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ audio_url: audioUrl }),
-  });
-
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(txt || "Emotion detection failed");
-  }
-
-  return await res.json();
 }

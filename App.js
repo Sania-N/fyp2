@@ -1,19 +1,21 @@
 // App.js
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { Component, useCallback, useEffect, useState } from 'react';
+import { ActivityIndicator, Text, View } from 'react-native';
 import { NavigationContainer, useNavigationContainerRef } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
-import { ActivityIndicator, View } from 'react-native';
 
 import { useAuth } from './useAuth';   // <-- Using your hook
+import { API_BASE_URL } from './api';
+import app, { auth as firebaseAuth, db as firebaseDb } from './firebase';
 import theme from './styles/theme';
 
 // Screens
 import OnboardingScreen from './screens/OnboardingScreen';
 import LoginScreen from './screens/LoginScreen';
 import SignupScreen from './screens/SignupScreen';
-import TrackMeScreen from './screens/TrackMeScreen';
+import HomeScreen from './screens/HomeScreen';
 import RecordScreen from './screens/RecordScreen';
 import SosScreen from './screens/SosScreen';
 import ChatbotScreen from './screens/ChatbotScreen';
@@ -25,64 +27,101 @@ import ProfileScreen from './screens/ProfileScreen';
 import RecordingsHistoryScreen from './screens/RecordingsHistoryScreen';
 import ContactsScreen from './screens/ContactsScreen';
 import AlertsScreen from './screens/AlertsScreen';
+import RealtimeMonitoringScreen from './screens/RealtimeMonitoringScreen';
 import TravelSessionWidget from './components/TravelSessionWidget';
 import { TravelSessionProvider, useTravelSession } from './context/TravelSessionContext';
 import { DangerAlertProvider } from './context/DangerAlertContext';
+import { DeviceConnectionProvider } from './context/DeviceConnectionContext';
+import { RealtimeThreatProvider } from './context/RealtimeThreatContext';
 import DangerPopupModal from './components/DangerPopupModal';
 import {
   attachNotificationListeners,
   detachNotificationListeners,
   initializeNotificationHandling,
   registerForPushNotifications,
+  supportsRemotePushNotifications,
 } from './services/notificationsService';
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 
-// ---------------------------
-// Main Tabs
-// ---------------------------
+console.log('[App] Module loaded');
+console.log('[App] API base URL:', API_BASE_URL);
+console.log('[App] Firebase app initialized:', Boolean(app));
+console.log('[App] Firebase auth/db ready:', Boolean(firebaseAuth), Boolean(firebaseDb));
+
+class AppErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error('[App] Unhandled render error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+          <Text style={{ fontSize: 18, fontWeight: '700', marginBottom: 8, textAlign: 'center' }}>
+            App failed to render
+          </Text>
+          <Text style={{ textAlign: 'center', color: '#666' }}>
+            Check the console logs for the startup error.
+          </Text>
+        </View>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
 function MainTabs() {
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
         headerShown: false,
-        tabBarActiveTintColor: 'rgba(255, 200, 220, 1)',
-        tabBarInactiveTintColor: 'rgba(255, 255, 255, 0.4)',
+        tabBarActiveTintColor: '#ff1493',
+        tabBarInactiveTintColor: '#666',
         tabBarStyle: {
-          height: 75,
-          paddingBottom: 8,
-          borderTopLeftRadius: 35,
-          borderTopRightRadius: 35,
-          borderBottomLeftRadius: 35,
-          borderBottomRightRadius: 35,
-          backgroundColor: '#2d1b2e',
-          borderTopWidth: 1,
-          borderTopColor: 'rgba(255, 200, 220, 0.2)',
           position: 'absolute',
-          bottom: 12,
-          left: 12,
-          right: 12,
-          shadowColor: '#000',
-          shadowOpacity: 0.4,
-          shadowOffset: { width: 0, height: 12 },
-          shadowRadius: 20,
-          elevation: 15,
+          left: 36,
+          right: 36,
+          bottom: 22,
+          backgroundColor: '#1a1a1a',
+          borderRadius: 18,
+          paddingBottom: 8,
+          paddingTop: 8,
+          height: 70,
+          borderTopWidth: 0,
           borderWidth: 1,
-          borderColor: 'rgba(255, 200, 220, 0.15)',
+          borderColor: 'rgba(0,0,0,0.12)',
+          elevation: 12,
+          shadowColor: '#000',
+          shadowOpacity: 0.18,
+          shadowOffset: { width: 0, height: 8 },
+          shadowRadius: 14,
+          overflow: 'visible',
         },
         tabBarIcon: ({ color }) => {
           const icons = {
+            "Home": "home-outline",
             "Track Me": "location-outline",
             "Record": "mic-outline",
             "SOS": "alert-circle-outline",
             "Routes": "map-outline",
           };
-          return <Ionicons name={icons[route.name]} size={26} color={color} />;
+          return <Ionicons name={icons[route.name]} size={28} color={color} />;
         },
       })}
     >
-      <Tab.Screen name="Track Me" component={TrackMeScreen} />
+      <Tab.Screen name="Home" component={HomeScreen} />
       <Tab.Screen name="Record" component={RecordScreen} />
       <Tab.Screen name="SOS" component={SosScreen} />
       <Tab.Screen name="Routes" component={RoutesScreen} />
@@ -142,6 +181,11 @@ function AppNavigator() {
             <Stack.Screen name="RecordingsHistory" component={RecordingsHistoryScreen} />
             <Stack.Screen name="ContactsScreen" component={ContactsScreen} />
             <Stack.Screen name="AlertsScreen" component={AlertsScreen} />
+            <Stack.Screen
+              name="RealtimeMonitoring"
+              component={RealtimeMonitoringScreen}
+              options={{ headerShown: false }}
+            />
           </>
         ) : (
           <>
@@ -164,33 +208,70 @@ function AppNavigator() {
 }
 
 export default function App() {
+  const [startupError, setStartupError] = useState(null);
+  const user = useAuth();
+
   useEffect(() => {
-    initializeNotificationHandling();
+    console.log('[App] Starting notification bootstrap');
 
-    registerForPushNotifications().catch((error) => {
-      console.error('Push notification registration failed:', error);
-    });
+    try {
+      initializeNotificationHandling();
 
-    attachNotificationListeners({
-      onNotificationReceived: (notification) => {
-        console.log('Foreground notification received:', notification?.request?.content?.data || {});
-      },
-      onNotificationResponse: (response) => {
-        console.log('Notification opened from background/quit:', response?.notification?.request?.content?.data || {});
-      },
-    });
+      if (supportsRemotePushNotifications()) {
+        registerForPushNotifications().catch((error) => {
+          console.error('[App] Push notification registration failed:', error);
+        });
+      } else {
+        console.info('[App] Remote push registration skipped in this runtime.');
+      }
+
+      attachNotificationListeners({
+        onNotificationReceived: (notification) => {
+          console.log('[App] Foreground notification received:', notification?.request?.content?.data || {});
+        },
+        onNotificationResponse: (response) => {
+          console.log('[App] Notification opened from background/quit:', response?.notification?.request?.content?.data || {});
+        },
+      });
+    } catch (error) {
+      console.error('[App] Startup initialization failed:', error);
+      setStartupError(error);
+    }
 
     return () => {
-      detachNotificationListeners();
+      try {
+        detachNotificationListeners();
+      } catch (error) {
+        console.warn('[App] Failed to detach notification listeners:', error);
+      }
     };
   }, []);
 
+  if (startupError) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+        <Text style={{ fontSize: 18, fontWeight: '700', marginBottom: 8, textAlign: 'center' }}>
+          Startup error
+        </Text>
+        <Text style={{ textAlign: 'center', color: '#666' }}>
+          The app could not finish initializing. Check logs for details.
+        </Text>
+      </View>
+    );
+  }
+
   return (
-    <TravelSessionProvider>
-      <DangerAlertProvider>
-        <AppNavigator />
-        <DangerPopupModal />
-      </DangerAlertProvider>
-    </TravelSessionProvider>
+    <AppErrorBoundary>
+      <TravelSessionProvider>
+        <DeviceConnectionProvider>
+          <DangerAlertProvider>
+            <RealtimeThreatProvider userUid={user?.uid}>
+              <AppNavigator />
+              <DangerPopupModal />
+            </RealtimeThreatProvider>
+          </DangerAlertProvider>
+        </DeviceConnectionProvider>
+      </TravelSessionProvider>
+    </AppErrorBoundary>
   );
 }

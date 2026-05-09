@@ -256,6 +256,16 @@ export default function RecordingsHistoryScreen() {
         Confidence: {(item.confidence * 100).toFixed(1)}%
       </Text>
     )}
+
+    <Text style={{ fontSize: 12, color: item.threat_detected ? "#D32F2F" : "#2E7D32", marginTop: 2 }}>
+      Threat: {item.threat_detected ? "DETECTED" : "CLEAR"}
+    </Text>
+
+    {item.risk_level && (
+      <Text style={{ fontSize: 12, color: "#555" }}>
+        Risk level: {String(item.risk_level).toUpperCase()}
+      </Text>
+    )}
   </View>
 )}
 

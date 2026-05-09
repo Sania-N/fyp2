@@ -17,6 +17,7 @@ import * as Location from 'expo-location';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { MaterialIcons } from '@expo/vector-icons';
 import theme from '../styles/theme';
+import { canRenderGoogleMaps, getGoogleMapsMissingKeyMessage } from '../utils/googleMaps';
 import { getRouteSafety } from '../services/routeSafetyService';
 import { useTravelSession } from '../context/TravelSessionContext';
 import {
@@ -1147,7 +1148,12 @@ const LocationDetailScreen = ({ navigation, route }) => {
         </View>
       )}
       {/* Map */}
-      {userLocation ? (
+      {!canRenderGoogleMaps ? (
+        <View style={styles.loadingContainer}>
+          <MaterialIcons name="map" size={32} color={theme.colors.primary} />
+          <Text style={styles.loadingText}>{getGoogleMapsMissingKeyMessage()}</Text>
+        </View>
+      ) : userLocation ? (
         <MapView
           ref={mapRef}
           style={styles.map}

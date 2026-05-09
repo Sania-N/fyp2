@@ -1,4 +1,3 @@
-import { GEMINI_API_KEY } from '@env';
 import React, { useState, useEffect } from 'react';
 import {
   View,
@@ -12,14 +11,21 @@ import {
   SafeAreaView,
   ActivityIndicator,
 } from 'react-native';
+import Constants from 'expo-constants';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import Header from '../components/Header';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const GEMINI_API_KEY =
+  Constants.expoConfig?.extra?.geminiApiKey ||
+  Constants.manifest?.extra?.geminiApiKey ||
+  process.env.GEMINI_API_KEY;
+
+const model = GEMINI_API_KEY
+  ? new GoogleGenerativeAI(GEMINI_API_KEY).getGenerativeModel({ model: "gemini-2.5-flash" })
+  : null;
 
 /* ===================== SYSTEM PROMPT ===================== */
 
@@ -193,14 +199,19 @@ export default function ChatbotScreen() {
   const sendMessage = async () => {
     if (input.trim() === '') return;
 
+    console.log('💬 Chatbot sendMessage called with:', input.substring(0, 50));
     const userMessage = { id: Date.now().toString(), text: input, sender: 'user' };
     setMessages((prev) => [...prev, userMessage]);
     setInput('');
     setLoading(true);
 
     try {
+      console.log('🔑 GEMINI_API_KEY present:', !!GEMINI_API_KEY);
       if (!GEMINI_API_KEY) {
         throw new Error('Gemini API Key is not configured');
+      }
+      if (!model) {
+        throw new Error('Gemini client is not initialized');
       }
 
       // Build conversation history (last 6 messages)
@@ -223,6 +234,7 @@ Assistant:
       const result = await model.generateContent(fullPrompt);
       const response = await result.response;
       const text = response.text();
+      console.log('✅ Gemini response received:', text.substring(0, 100));
 
       const botReply = {
         id: (Date.now() + 1).toString(),
@@ -232,7 +244,8 @@ Assistant:
 
       setMessages((prev) => [...prev, botReply]);
     } catch (error) {
-      console.error('Gemini API Error:', error);
+      console.error('❌ Gemini API Error:', error?.message);
+      console.error('Error full:', error);
 
       let friendlyMessage = "I'm having trouble responding right now. Please try again.";
 

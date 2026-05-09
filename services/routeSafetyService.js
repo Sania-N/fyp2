@@ -1,6 +1,6 @@
 import { API_BASE_URL } from '../api';
 
-const FALLBACK_SAFE_ROUTE_ENDPOINT = 'http://YOUR_BACKEND_IP:8000/safe-route';
+const FALLBACK_SAFE_ROUTE_ENDPOINT = `${API_BASE_URL}/safe-route`;
 
 export const getRouteSafety = async ({
   origin_lat,

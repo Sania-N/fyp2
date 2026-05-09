@@ -1,4 +1,5 @@
-import React, { useState, useCallback, useFocusEffect } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
 import {
   View,
   Text,
@@ -10,15 +11,67 @@ import {
   ScrollView,
   SafeAreaView,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { MaterialIcons } from '@expo/vector-icons';
 import theme from '../styles/theme';
 import { useDeviceConnection } from '../context/DeviceConnectionContext';
+import { useRealtimeThreat } from '../context/RealtimeThreatContext';
+import { useNavigation } from '@react-navigation/native';
 
-export default function TrackMeScreen() {
-  const { connectedDevice, telemetry, isConnecting, error, connect, disconnect } = useDeviceConnection();
-  const [deviceIP, setDeviceIP] = useState('192.168.100.15'); // Default ESP32 IP
+const LAST_DEVICE_IP_STORAGE_KEY = '@safetyapp_last_watch_ip';
+
+export default function HomeScreen() {
+  const { connectedDevice, telemetry, isConnecting, error, connect, disconnect, espAudioWaveform, espAudioConnected, triggerEspCapture } = useDeviceConnection();
+  const { isMonitoring, startMonitoring, stopMonitoring } = useRealtimeThreat();
+  const navigation = useNavigation();
+  const [deviceIP, setDeviceIP] = useState('');
   const [showIPInput, setShowIPInput] = useState(false);
+  const [waveformSamples, setWaveformSamples] = useState(() => Array(48).fill(0));
+  const [testMonitoringLoading, setTestMonitoringLoading] = useState(false);
+  const [testCaptureLoading, setTestCaptureLoading] = useState(false);
+  const lastTelemetryAtRef = useRef(0);
+
+  useEffect(() => {
+    if (!connectedDevice) {
+      setWaveformSamples(Array(48).fill(0));
+      lastTelemetryAtRef.current = 0;
+      return;
+    }
+
+    // Prefer live ESP WebSocket waveform when available
+    if (espAudioConnected && Array.isArray(espAudioWaveform) && espAudioWaveform.length === 48) {
+      const normalizedWaveform = espAudioWaveform.map((s) => Math.max(0, Math.min(100, Number(s) || 0)));
+      setWaveformSamples(normalizedWaveform);
+      return;
+    }
+
+    // Fallback to telemetry waveform from HTTP polling
+    const receivedAt = telemetry.receivedAt || Date.now();
+    if (receivedAt <= (lastTelemetryAtRef.current || 0)) {
+      return;
+    }
+    lastTelemetryAtRef.current = receivedAt;
+
+    const liveWaveform = Array.isArray(telemetry.audioWaveform) && telemetry.audioWaveform.length > 0
+      ? telemetry.audioWaveform.slice(-48)
+      : null;
+
+    if (liveWaveform) {
+      const normalizedWaveform = Array.from({ length: 48 }, (_, index) => {
+        const sample = liveWaveform[index] ?? 0;
+        return Math.max(0, Math.min(100, Number(sample) || 0));
+      });
+      setWaveformSamples(normalizedWaveform);
+      return;
+    }
+
+    const nextSample = Math.max(0, Math.min(100, Number(telemetry.audioLevel) || 0));
+    setWaveformSamples((current) => {
+      const nextHistory = [...current.slice(-47), nextSample];
+      return nextHistory;
+    });
+  }, [connectedDevice, espAudioConnected, espAudioWaveform, telemetry.audioLevel, telemetry.audioWaveform, telemetry.receivedAt]);
 
   useFocusEffect(
     useCallback(() => {
@@ -28,10 +81,38 @@ export default function TrackMeScreen() {
     }, [])
   );
 
-  const handleConnect = useCallback(() => {
+  useEffect(() => {
+    let mounted = true;
+
+    const loadSavedIP = async () => {
+      try {
+        const storedIP = await AsyncStorage.getItem(LAST_DEVICE_IP_STORAGE_KEY);
+        if (!mounted) return;
+
+        if (storedIP) {
+          setDeviceIP(storedIP);
+        }
+      } catch (storageError) {
+        console.warn('[Home] Failed to load saved IP:', storageError);
+      }
+    };
+
+    loadSavedIP();
+
+    return () => {
+      mounted = false;
+    };
+  }, [connect, connectedDevice]);
+
+  const handleConnect = useCallback(async () => {
     if (!deviceIP.trim()) {
       Alert.alert('Error', 'Please enter device IP address');
       return;
+    }
+    try {
+      await AsyncStorage.setItem(LAST_DEVICE_IP_STORAGE_KEY, deviceIP.trim());
+    } catch (storageError) {
+      console.warn('[Home] Failed to store device IP:', storageError);
     }
     connect(deviceIP.trim());
     setShowIPInput(false);
@@ -48,6 +129,79 @@ export default function TrackMeScreen() {
     ]);
   }, [disconnect]);
 
+  // TEST BUTTON: Toggle threat monitoring
+  const handleToggleMonitoring = useCallback(async () => {
+    setTestMonitoringLoading(true);
+    try {
+      if (isMonitoring) {
+        stopMonitoring();
+        Alert.alert('Monitoring Stopped', 'Threat detection is now OFF.');
+        console.log('✅ [Test] Monitoring STOPPED');
+      } else {
+        startMonitoring();
+        Alert.alert('Monitoring Started', '⏱️ Calibrating for 2 minutes...\n\nAfter calibration, real triggers will capture audio.');
+        console.log('✅ [Test] Monitoring STARTED');
+      }
+    } catch (err) {
+      Alert.alert('Error', `Failed to toggle monitoring: ${err.message}`);
+      console.error('[Test] Toggle monitoring error:', err);
+    } finally {
+      setTestMonitoringLoading(false);
+    }
+  }, [isMonitoring, startMonitoring, stopMonitoring]);
+
+  // TEST BUTTON: Manually trigger audio capture
+  const handleTestTriggerCapture = useCallback(async () => {
+    if (!connectedDevice) {
+      Alert.alert('Not Connected', 'Please connect to the ESP32 first.');
+      return;
+    }
+    if (!espAudioConnected) {
+      Alert.alert('WebSocket Not Connected', 'Audio stream not connected yet. Try again in a few seconds.');
+      return;
+    }
+
+    setTestCaptureLoading(true);
+    try {
+      // Get current user ID from async storage or use test ID
+      let userUid = 'test-user-' + Date.now();
+      try {
+        const stored = await AsyncStorage.getItem('@user_uid');
+        if (stored) userUid = stored;
+      } catch (e) {
+        console.warn('[Test] Could not load user UID, using test ID');
+      }
+
+      Alert.alert(
+        'Test Capture',
+        'This will capture and upload the last 8 seconds of audio from the rolling buffer. Confirm?',
+        [
+          { text: 'Cancel', onPress: () => setTestCaptureLoading(false), style: 'cancel' },
+          {
+            text: 'Capture Now',
+            onPress: async () => {
+              try {
+                console.log('🚨 [Test] Triggering MANUAL audio capture...');
+                await triggerEspCapture(userUid);
+                Alert.alert('✅ Capture Triggered', 'Audio was extracted from buffer and uploaded to Supabase.');
+                console.log('✅ [Test] Capture completed');
+              } catch (err) {
+                Alert.alert('❌ Capture Failed', err.message);
+                console.error('[Test] Capture error:', err);
+              } finally {
+                setTestCaptureLoading(false);
+              }
+            },
+          },
+        ]
+      );
+    } catch (err) {
+      Alert.alert('Error', `Failed to prepare capture: ${err.message}`);
+      console.error('[Test] Prepare error:', err);
+      setTestCaptureLoading(false);
+    }
+  }, [connectedDevice, espAudioConnected, triggerEspCapture]);
+
   return (
     <LinearGradient colors={['#2d1b2e', '#3d0d3d', '#1a3d4f']} style={styles.container}>
       <SafeAreaView style={styles.safeArea}>
@@ -62,7 +216,7 @@ export default function TrackMeScreen() {
             <View style={styles.statusRow}>
               <View style={styles.statusLabel}>
                 <MaterialIcons
-                  name={connectedDevice ? 'devices' : 'devices-off'}
+                  name={connectedDevice ? 'devices' : 'portable-wifi-off'}
                   size={24}
                   color={connectedDevice ? '#4CAF50' : '#999'}
                 />
@@ -143,6 +297,107 @@ export default function TrackMeScreen() {
                 <Text style={styles.buttonText}>Disconnect</Text>
               </TouchableOpacity>
             )}
+          </View>
+
+          {/* Connection Guide */}
+          <View style={styles.guideCard}>
+            <Text style={styles.cardTitle}>How To Connect The Watch</Text>
+            <Text style={styles.guideText}>1. Turn on your phone hotspot and keep it open.</Text>
+            <Text style={styles.guideText}>2. Power the watch and wait until the ESP32 joins the hotspot.</Text>
+            <Text style={styles.guideText}>3. Open this screen, and the app will auto-connect to the last saved IP.</Text>
+            <Text style={styles.guideText}>4. If needed, tap Connect to Watch and enter the IP once.</Text>
+          </View>
+
+          <TouchableOpacity
+            style={styles.triggerButton}
+            onPress={() => navigation.navigate('RealtimeMonitoring')}
+          >
+            <MaterialIcons name="graphic-eq" size={20} color="#fff" />
+            <Text style={styles.buttonText}>Open Trigger Monitor</Text>
+          </TouchableOpacity>
+
+          {/* TEST SECTION - Only visible when connected */}
+          {connectedDevice && (
+            <View style={[styles.telemetryCard, { backgroundColor: 'rgba(255, 150, 100, 0.15)', borderColor: 'rgba(255, 150, 100, 0.4)' }]}>
+              <Text style={[styles.cardTitle, { color: '#ff9966' }]}>🧪 Test Controls (DEV ONLY)</Text>
+              
+              <TouchableOpacity
+                style={[
+                  styles.testButton,
+                  { backgroundColor: isMonitoring ? '#ff6b6b' : '#4CAF50' },
+                  testMonitoringLoading && { opacity: 0.6 }
+                ]}
+                onPress={handleToggleMonitoring}
+                disabled={testMonitoringLoading}
+              >
+                {testMonitoringLoading ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <>
+                    <MaterialIcons name={isMonitoring ? 'stop' : 'play-arrow'} size={18} color="#fff" />
+                    <Text style={styles.buttonText}>{isMonitoring ? 'Stop Monitoring' : 'Start Monitoring'}</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.testButton,
+                  { backgroundColor: '#ff6b6b' },
+                  (testCaptureLoading || !espAudioConnected) && { opacity: 0.6 }
+                ]}
+                onPress={handleTestTriggerCapture}
+                disabled={testCaptureLoading || !espAudioConnected}
+              >
+                {testCaptureLoading ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <>
+                    <MaterialIcons name="mic" size={18} color="#fff" />
+                    <Text style={styles.buttonText}>{espAudioConnected ? 'Test Capture' : 'WS Not Ready'}</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+
+              <Text style={styles.testHint}>
+                <Text style={{ fontWeight: '600' }}>Status:</Text> Monitoring: {isMonitoring ? '🟢 ON' : '🔴 OFF'} | Audio Stream: {espAudioConnected ? '🟢 LIVE' : '🔴 OFFLINE'}
+              </Text>
+            </View>
+          )}
+
+          {/* Live Audio Waveform */}
+          <View style={styles.telemetryCard}>
+            <View style={styles.waveHeaderRow}>
+              <Text style={styles.cardTitle}>Audio Waveform</Text>
+              <Text style={styles.waveValue}>{Math.round(Number(telemetry.audioLevel) || 0)}%</Text>
+            </View>
+            <Text style={styles.waveHint}>
+              Rolling live trace from ESP32 mic activity. The app receives hardware waveform peaks plus trigger-window status.
+            </Text>
+            {telemetry.audioCaptureActive && (
+              <Text style={styles.captureStatus}>Capture window active: session {telemetry.audioCaptureSession}</Text>
+            )}
+            <View style={styles.waveformWrap}>
+              {waveformSamples.map((sample, index) => {
+                const normalized = Math.max(0, Math.min(100, Number(sample) || 0));
+                const barHeight = Math.max(6, (normalized / 100) * 58);
+                const isPeak = index === waveformSamples.length - 1;
+
+                return (
+                  <View
+                    key={index}
+                    style={[
+                      styles.waveBar,
+                      {
+                        height: barHeight,
+                        opacity: normalized > 0 ? (isPeak ? 1 : 0.7) : 0.25,
+                        backgroundColor: normalized > 70 ? '#ff6b6b' : '#ff1493',
+                      },
+                    ]}
+                  />
+                );
+              })}
+            </View>
           </View>
 
           {/* Telemetry Display */}
@@ -311,6 +566,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+    flex: 1,
   },
   statusLabelText: {
     fontSize: 16,
@@ -320,6 +576,8 @@ const styles = StyleSheet.create({
   statusValue: {
     fontSize: 16,
     fontWeight: '700',
+    flexShrink: 1,
+    textAlign: 'right',
   },
   errorBox: {
     flexDirection: 'row',
@@ -392,6 +650,31 @@ const styles = StyleSheet.create({
     gap: 12,
     marginBottom: 20,
   },
+  guideCard: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 200, 220, 0.2)',
+    marginBottom: 16,
+  },
+  triggerButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    backgroundColor: '#ff1493',
+    marginBottom: 16,
+  },
+  guideText: {
+    fontSize: 14,
+    color: '#fff',
+    lineHeight: 20,
+    marginBottom: 6,
+  },
   telemetryCard: {
     backgroundColor: 'rgba(255, 255, 255, 0.08)',
     borderRadius: 12,
@@ -405,6 +688,42 @@ const styles = StyleSheet.create({
     color: '#ffc8dc',
     marginBottom: 12,
     textTransform: 'uppercase',
+  },
+  waveHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  waveValue: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#4CAF50',
+  },
+  waveHint: {
+    fontSize: 13,
+    color: '#999',
+    marginBottom: 12,
+  },
+  captureStatus: {
+    fontSize: 12,
+    color: '#4CAF50',
+    marginBottom: 10,
+    fontWeight: '600',
+  },
+  waveformWrap: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    justifyContent: 'space-between',
+    height: 64,
+    paddingHorizontal: 2,
+    gap: 3,
+  },
+  waveBar: {
+    flex: 1,
+    minWidth: 4,
+    borderRadius: 999,
+    backgroundColor: '#ff1493',
+    opacity: 0.9,
   },
   dataRow: {
     flexDirection: 'row',
@@ -486,5 +805,21 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: '#ffc8dc',
+  },
+  testButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    marginBottom: 8,
+  },
+  testHint: {
+    fontSize: 12,
+    color: '#999',
+    marginTop: 8,
+    textAlign: 'center',
   },
 });

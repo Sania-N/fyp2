@@ -108,7 +108,7 @@ export default function MenuScreen() {
               <MenuItem
                 icon="home-outline"
                 title="Dashboard"
-                onPress={() => navigation.navigate('MainTabs', { screen: 'Track Me' })}
+                onPress={() => navigation.navigate('MainTabs', { screen: 'Home' })}
               />
               <View style={styles.menuDivider} />
 
@@ -125,26 +125,13 @@ export default function MenuScreen() {
                 onPress={() => navigation.navigate('MainTabs', { screen: 'Routes' })}
               />
               <View style={styles.menuDivider} />
-
-              <MenuItem
-                icon="shield-outline"
-                title="Geo-fencing"
-                onPress={() => {}}
-              />
-              <View style={styles.menuDivider} />
-
               <MenuItem
                 icon="chatbubbles-outline"
                 title="AI Chatbot"
                 onPress={() => navigation.navigate('ChatbotScreen')}
               />
               <View style={styles.menuDivider} />
-
-              <MenuItem
-                icon="settings-outline"
-                title="Settings"
-                onPress={() => {}}
-              />
+              
             </View>
 
             {/* Logout Button */}

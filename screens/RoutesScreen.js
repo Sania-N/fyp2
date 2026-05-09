@@ -16,6 +16,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { MaterialIcons } from '@expo/vector-icons';
 import theme from '../styles/theme';
 import { getRouteSafety } from '../services/routeSafetyService';
+import { canRenderGoogleMaps, getGoogleMapsMissingKeyMessage } from '../utils/googleMaps';
 import {
   checkGeoFence,
   fetchDangerZones,
@@ -700,7 +701,12 @@ const RoutesScreen = ({ navigation, route }) => {
           </TouchableOpacity>
         </View>
         {/* Map View */}
-        {mapLoading ? (
+        {!canRenderGoogleMaps ? (
+          <View style={styles.loadingContainer}>
+            <MaterialIcons name="map" size={32} color={theme.colors.primary} />
+            <Text style={styles.loadingText}>{getGoogleMapsMissingKeyMessage()}</Text>
+          </View>
+        ) : mapLoading ? (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color={theme.colors.primary} />
             <Text style={styles.loadingText}>Loading map...</Text>

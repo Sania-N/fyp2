@@ -40,37 +40,48 @@ const toClockTime = (timestamp) => {
   }
 };
 
-const buildAlertDetailLine = (alert) => {
+const buildReadableAlertSummary = (alert) => {
   const details = alert?.details || {};
-  const parts = [];
+  const sentences = [];
 
-  if (details.emotion) parts.push(`emotion=${details.emotion}`);
-
-  const confidence = toSafeNumber(details.emotionConfidence);
-  if (confidence !== null) parts.push(`confidence=${confidence.toFixed(3)}`);
-
-  const motion = toSafeNumber(details.motion);
-  if (motion !== null) parts.push(`motion=${motion.toFixed(2)}`);
-
-  const heartRate = toSafeNumber(details.heartRate);
-  if (heartRate !== null) parts.push(`heart_rate=${heartRate.toFixed(0)} bpm`);
-
-  if (details.riskLevel) parts.push(`risk=${details.riskLevel}`);
-  if (details.buttonPressed === true) parts.push('button_pressed=true');
-  if (details.sosSent === true) parts.push('sos_sent=true');
-  if (details.sosSent === false) parts.push('sos_sent=false');
-  if (details.contactName) parts.push(`contact=${details.contactName}`);
-  if (details.reason) parts.push(`reason=${details.reason}`);
-  if (details.action) parts.push(`action=${details.action}`);
-
-  const timerRemaining = toSafeNumber(details.timerRemaining);
-  if (timerRemaining !== null) parts.push(`timer_remaining=${timerRemaining}s`);
-
-  if (parts.length === 0) {
-    return 'No extra details';
+  const emotion = details.emotion;
+  if (emotion) {
+    const confidence = toSafeNumber(details.emotionConfidence);
+    sentences.push(
+      confidence !== null
+        ? `Emotion detected: ${emotion} (confidence ${Math.round(confidence * 100)}%).`
+        : `Emotion detected: ${emotion}.`
+    );
   }
 
-  return parts.join(', ');
+  const heartRate = toSafeNumber(details.heartRate);
+  if (heartRate !== null) sentences.push(`Heart rate: ${heartRate.toFixed(0)} bpm.`);
+
+  const motion = toSafeNumber(details.motion);
+  if (motion !== null) sentences.push(`Motion level: ${motion.toFixed(1)}.`);
+
+  if (details.audioLevel !== undefined && details.audioLevel !== null) {
+    const audioLevel = toSafeNumber(details.audioLevel);
+    if (audioLevel !== null) sentences.push(`Audio level: ${audioLevel.toFixed(0)}.`);
+  }
+
+  if (details.riskLevel) sentences.push(`Risk level: ${details.riskLevel}.`);
+  if (details.reason) sentences.push(`Reason: ${details.reason}.`);
+  if (details.action) sentences.push(`Action taken: ${details.action}.`);
+  if (details.contactName) sentences.push(`Contact: ${details.contactName}.`);
+
+  const timerRemaining = toSafeNumber(details.timerRemaining);
+  if (timerRemaining !== null) sentences.push(`Timer remaining: ${timerRemaining.toFixed(0)} seconds.`);
+
+  if (details.buttonPressed === true) sentences.push('Manual SOS button was pressed.');
+  if (details.sosSent === true) sentences.push('SOS was sent.');
+  if (details.sosSent === false) sentences.push('SOS was not sent.');
+
+  if (sentences.length === 0) {
+    return 'No additional details available.';
+  }
+
+  return sentences.join(' ');
 };
 
 const buildTodaysAlertsContext = async () => {
@@ -81,18 +92,20 @@ const buildTodaysAlertsContext = async () => {
       .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
     if (todayItems.length === 0) {
-      return 'DETAILS (Today):\nNo alert events recorded today.';
+      return 'Today:\nNo alert events were recorded.';
     }
 
-    const rows = todayItems.map((item, index) => {
+    const rows = todayItems.map((item) => {
       const timeText = toClockTime(item?.timestamp) || 'Unknown time';
-      return `${index + 1}. [${timeText}] ${item?.message || 'Alert event'}\n   detail: ${buildAlertDetailLine(item)}`;
+      const headline = item?.message || 'Alert event detected';
+      const summary = buildReadableAlertSummary(item);
+      return `At ${timeText}, ${headline}. ${summary}`;
     });
 
-    return `DETAILS (Today):\n${rows.join('\n')}`;
+    return `Today:\n${rows.map((row) => `- ${row}`).join('\n')}`;
   } catch (error) {
     console.warn('Failed to load today alert context for SOS message:', error);
-    return 'DETAILS (Today):\nCould not load alert details.';
+    return 'Today:\nCould not load alert details.';
   }
 };
 
@@ -106,7 +119,7 @@ const generateSOSMessage = async (latitude, longitude) => {
   const googleMapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
   const detailsBlock = await buildTodaysAlertsContext();
 
-  return `🚨 SOS ALERT 🚨\n\nI am in danger. Please help me immediately!\n\n${detailsBlock}\n\n📍 Location:\n${latitude.toFixed(6)}, ${longitude.toFixed(6)}\n\n🗺️ ${googleMapsLink}\n\nSent from Safety App.`;
+  return `🚨 SOS ALERT 🚨\n\nI need help right now. Please contact me as soon as possible.\n\n${detailsBlock}\n\nCurrent location:\n${latitude.toFixed(6)}, ${longitude.toFixed(6)}\n${googleMapsLink}\n\nSent from Safety App.`;
 };
 
 /**
