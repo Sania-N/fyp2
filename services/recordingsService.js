@@ -274,6 +274,73 @@ export async function detectEmotion(audioUrl, esp32Telemetry = null) {
   try {
     console.log('🧠 [detectEmotion] Starting with:', { audioUrl, esp32Telemetry: !!esp32Telemetry });
 
+    if (esp32Telemetry) {
+      console.log('📊 [detectEmotion] Calling /realtime-threat endpoint...');
+
+      const hasDirectMotion = typeof esp32Telemetry.motion === 'number' && Number.isFinite(esp32Telemetry.motion);
+      const hasImuAngles =
+        Number.isFinite(esp32Telemetry.roll) &&
+        Number.isFinite(esp32Telemetry.pitch) &&
+        Number.isFinite(esp32Telemetry.yaw);
+
+      const motion = hasDirectMotion
+        ? esp32Telemetry.motion
+        : hasImuAngles
+          ? Math.sqrt(
+              (esp32Telemetry.roll || 0) * (esp32Telemetry.roll || 0) +
+              (esp32Telemetry.pitch || 0) * (esp32Telemetry.pitch || 0) +
+              (esp32Telemetry.yaw || 0) * (esp32Telemetry.yaw || 0)
+            )
+          : 0;
+
+      const heartRateValue = Number(esp32Telemetry.heartRate);
+      const heartRate = Number.isFinite(heartRateValue) && heartRateValue > 0 ? heartRateValue : 0;
+
+      console.log('📡 [detectEmotion] Hardware payload to /realtime-threat:', {
+        motion,
+        heartRate,
+        fingerOn: esp32Telemetry.fingerOn,
+        roll: esp32Telemetry.roll,
+        pitch: esp32Telemetry.pitch,
+        yaw: esp32Telemetry.yaw,
+      });
+
+      const combinedResponse = await fetch(`${API_BASE_URL}/realtime-threat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-trigger-source': 'realtime',
+          'x-realtime': 'true',
+        },
+        body: JSON.stringify({
+          audio_url: audioUrl,
+          motion,
+          heart_rate: heartRate,
+          trigger_reason: 'recording_upload',
+        }),
+      });
+
+      if (!combinedResponse.ok) {
+        throw new Error(`Realtime threat detection failed: ${combinedResponse.status}`);
+      }
+
+      const combinedData = await combinedResponse.json();
+      console.log('📊 [detectEmotion] Realtime threat result:', combinedData);
+
+      return {
+        audio_url: audioUrl,
+        emotion: combinedData.emotion ?? null,
+        confidence: combinedData.confidence ?? null,
+        panic: combinedData.panic ?? false,
+        risk_level: combinedData.risk_level ?? null,
+        motion: typeof combinedData.motion_used === 'number' ? combinedData.motion_used : motion,
+        heart_rate: typeof combinedData.heart_rate_used === 'number' ? combinedData.heart_rate_used : heartRate,
+        timestamp: combinedData.timestamp || new Date().toISOString(),
+        hardware_data_used: true,
+        sensor_context: esp32Telemetry,
+      };
+    }
+
     // Step 1: Get emotion from audio
     console.log('📊 [detectEmotion] Calling /predict endpoint...');
     const emotionResponse = await fetch(`${API_BASE_URL}/predict`, {

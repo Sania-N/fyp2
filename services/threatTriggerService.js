@@ -18,13 +18,20 @@ export class ThreatTriggerService {
 
     // Thresholds (relative to baseline)
     this.hrSpikeThreshold = 25; // bpm above baseline
-    this.motionAbnormalThreshold = 30; // degrees magnitude
-    // Require a sudden change (delta) to avoid static tilt false positives
-    this.motionDeltaThreshold = 15; // degrees change within short interval
+    // Motion thresholds are on a 0-10 normalized scale (see calculateMotionFromIMU)
+    // Lowered for higher sensitivity to smaller movements
+    this.motionAbnormalThreshold = 3; // 0-10 scale (more sensitive)
+    // Require a smaller sudden change to catch quick small movements (0-10 scale)
+    this.motionDeltaThreshold = 1.0; // normalized change within short interval
     this.loudSoundThreshold = 70; // 0-100 audio level scale
 
     // Debouncing (avoid single-reading false positives)
-    this.consecutiveReadingsRequired = 3;
+    // Use separate requirements per signal: HR needs more consecutive confirmations,
+    // motion and sound can be fewer readings to stay responsive.
+    this.consecutiveReadingsRequiredHr = 5;
+    // Make motion responsive: single confirmation is enough
+    this.consecutiveReadingsRequiredMotion = 1;
+    this.consecutiveReadingsRequiredSound = 2;
     this.triggerCounts = {
       hr_spike: 0,
       motion_abnormal: 0,
@@ -43,6 +50,25 @@ export class ThreatTriggerService {
 
     // Default inhibition safety window after a trigger (ms)
     this.defaultInhibitMs = 20000; // 20s
+    // Track last heart rate reading to detect sudden jumps
+    this.lastHeartRate = null;
+  }
+
+  /**
+   * Normalize and validate heart-rate input.
+   * Treat 0/invalid/finger-off values as unavailable data.
+   */
+  getValidHeartRate(telemetry) {
+    const raw = Number(telemetry?.heartRate);
+    const fingerOn = telemetry?.fingerOn;
+
+    if (!Number.isFinite(raw)) return null;
+    if (fingerOn === false) return null;
+
+    // Typical wearable HR range; reject zero/noise/outliers.
+    if (raw < 35 || raw > 220) return null;
+
+    return raw;
   }
 
   /**
@@ -55,14 +81,22 @@ export class ThreatTriggerService {
       console.log('🔧 [ThreatTrigger] Calibration started - sampling for 2 minutes...');
     }
 
-    this.calibrationSamples.push(telemetry.heartRate);
+    const validHeartRate = this.getValidHeartRate(telemetry);
+    if (validHeartRate !== null) {
+      this.calibrationSamples.push(validHeartRate);
+    }
 
     const elapsedMs = Date.now() - this.calibrationStartTime;
     if (elapsedMs >= this.calibrationDuration) {
-      // Calculate baseline (average of samples)
-      this.baselineHR = Math.round(
-        this.calibrationSamples.reduce((a, b) => a + b, 0) / this.calibrationSamples.length
-      );
+      // Calculate baseline from valid samples, with a safe fallback.
+      if (this.calibrationSamples.length > 0) {
+        this.baselineHR = Math.round(
+          this.calibrationSamples.reduce((a, b) => a + b, 0) / this.calibrationSamples.length
+        );
+      } else {
+        this.baselineHR = 75;
+        console.warn('⚠️ [ThreatTrigger] No valid HR samples during calibration. Using fallback baseline 75 bpm.');
+      }
       this.isCalibrated = true;
       console.log(`✅ [ThreatTrigger] Calibration complete! Baseline HR: ${this.baselineHR} bpm`);
       return true;
@@ -83,18 +117,28 @@ export class ThreatTriggerService {
     }
 
     if (!this.isCalibrated) {
-      const calibrated = this.startCalibration(telemetry);
-      if (!calibrated) {
-        return []; // Still calibrating
-      }
+      // Keep collecting HR samples for calibration, but do not block other triggers.
+      this.startCalibration(telemetry);
     }
 
     const triggers = [];
 
+    const validHeartRate = this.getValidHeartRate(telemetry);
+
     // ═══════════════════════════════════════════
-    // TRIGGER A: Heart Rate Spike
-    // ═══════════════════════════════════════════
-    const hrSpike = telemetry.heartRate > this.baselineHR + this.hrSpikeThreshold;
+    // TRIGGER A: Heart Rate Spike (allow immediately, use fallback baseline)
+    // ═══════════════════════════════════════════════════════════════════
+    // Use a safe fallback baseline when calibration hasn't completed yet
+    const baselineUsed = Number.isFinite(this.baselineHR) ? this.baselineHR : 75;
+    // Require both exceeding baseline+threshold AND a sudden jump to avoid brief touch artifacts
+    const hrDelta = validHeartRate !== null && Number.isFinite(this.lastHeartRate)
+      ? Math.abs(validHeartRate - this.lastHeartRate)
+      : 0;
+    const suddenHRJump = hrDelta >= 10; // bpm required change since last sample
+    const hrSpike =
+      validHeartRate !== null &&
+      validHeartRate > baselineUsed + this.hrSpikeThreshold &&
+      suddenHRJump;
     
     if (hrSpike) {
       this.triggerCounts.hr_spike++;
@@ -102,35 +146,35 @@ export class ThreatTriggerService {
       this.triggerCounts.hr_spike = 0; // Reset counter
     }
 
-    if (this.triggerCounts.hr_spike >= this.consecutiveReadingsRequired) {
+    if (this.triggerCounts.hr_spike >= this.consecutiveReadingsRequiredHr) {
       triggers.push({
         type: 'HR_SPIKE',
-        value: telemetry.heartRate,
+        value: validHeartRate,
         baseline: this.baselineHR,
-        spike: telemetry.heartRate - this.baselineHR,
+        spike: validHeartRate - this.baselineHR,
         severity: 'MEDIUM',
-        description: `Heart rate spike: ${telemetry.heartRate} bpm (baseline: ${this.baselineHR})`,
+        description: `Heart rate spike: ${validHeartRate} bpm (baseline: ${this.baselineHR})`,
       });
-      console.log(`⚠️ [ThreatTrigger] HR_SPIKE detected: ${telemetry.heartRate} bpm`);
+      console.log(`⚠️ [ThreatTrigger] HR_SPIKE detected: ${validHeartRate} bpm`);
     }
 
     // ═══════════════════════════════════════════
-    // TRIGGER B: Motion Abnormality
+    // TRIGGER B: Motion Abnormality (use normalized 0-10 motion)
     // ═══════════════════════════════════════════
-    const motionMagnitude = Math.sqrt(
-      telemetry.roll * telemetry.roll +
-      telemetry.pitch * telemetry.pitch +
-      telemetry.yaw * telemetry.yaw
+    const rawMotion = Math.sqrt(
+      (telemetry.roll || 0) * (telemetry.roll || 0) +
+      (telemetry.pitch || 0) * (telemetry.pitch || 0) +
+      (telemetry.yaw || 0) * (telemetry.yaw || 0)
     );
 
-    // Compute delta since last sample
+    // Normalize to 0-10 (same logic as dangerDetectionService.calculateMotionFromIMU)
+    const motionMagnitude = Math.min(10, rawMotion / 5);
+
+    // Compute delta since last sample (normalized scale)
     const now = Date.now();
     const delta = Math.abs(motionMagnitude - (this.lastMotionMagnitude || 0));
     const deltaMs = now - (this.lastMotionAt || now);
 
-    // Consider motion abnormal only if both magnitude exceeds threshold AND there
-    // is a sudden change (delta) within a short interval. This avoids static tilt
-    // (device placed at angle) from triggering.
     const suddenChange = delta >= this.motionDeltaThreshold && deltaMs < 2000; // within 2s
     const motionAbnormal = motionMagnitude > this.motionAbnormalThreshold && suddenChange;
 
@@ -140,21 +184,26 @@ export class ThreatTriggerService {
       this.triggerCounts.motion_abnormal = 0;
     }
 
-    if (this.triggerCounts.motion_abnormal >= this.consecutiveReadingsRequired) {
+    if (this.triggerCounts.motion_abnormal >= this.consecutiveReadingsRequiredMotion) {
       triggers.push({
         type: 'MOTION_ABNORMAL',
         value: motionMagnitude,
         threshold: this.motionAbnormalThreshold,
         delta: delta,
         severity: 'MEDIUM',
-        description: `Motion detected: ${motionMagnitude.toFixed(1)}° (delta ${delta.toFixed(1)}°, threshold: ${this.motionAbnormalThreshold}°)`,
+        description: `Motion detected: ${motionMagnitude.toFixed(2)} (delta ${delta.toFixed(2)}, threshold: ${this.motionAbnormalThreshold})`,
       });
-      console.log(`⚠️ [ThreatTrigger] MOTION_ABNORMAL detected: ${motionMagnitude.toFixed(1)}° (delta ${delta.toFixed(1)}°)`);
+      console.log(`⚠️ [ThreatTrigger] MOTION_ABNORMAL detected: ${motionMagnitude.toFixed(2)} (delta ${delta.toFixed(2)})`);
     }
 
-    // Update last motion tracking
+    // Update last motion tracking (store normalized value)
     this.lastMotionMagnitude = motionMagnitude;
     this.lastMotionAt = now;
+
+    // Update last heart rate reading for next delta calculation
+    if (validHeartRate !== null) {
+      this.lastHeartRate = validHeartRate;
+    }
 
     // ═══════════════════════════════════════════
     // TRIGGER C: Loud Sound
@@ -167,7 +216,7 @@ export class ThreatTriggerService {
       this.triggerCounts.loud_sound = 0;
     }
 
-    if (this.triggerCounts.loud_sound >= this.consecutiveReadingsRequired) {
+    if (this.triggerCounts.loud_sound >= this.consecutiveReadingsRequiredSound) {
       triggers.push({
         type: 'LOUD_SOUND',
         value: telemetry.audioLevel,

@@ -5,6 +5,7 @@ const SAMPLE_RATE = 16000;
 const CHANNELS = 1;
 const BYTES_PER_SAMPLE = 2;
 const BUFFER_SECONDS = 8; // keep rolling 8s
+const MIN_CAPTURE_SECONDS = 8;
 
 class EspWebsocketService {
   ws = null;
@@ -104,6 +105,7 @@ class EspWebsocketService {
     this.ringBuffer = null;
     this.ringWritePos = 0;
     this.samplesWritten = 0;
+    this.latestTelemetry = null;
   }
 
   // Extract last N seconds of samples (Int16Array)
@@ -119,10 +121,17 @@ class EspWebsocketService {
     return out;
   }
 
-  async captureAndUpload(userUid, frontImageUri = null, backImageUri = null) {
+  async captureAndUpload(userUid, frontImageUri = null, backImageUri = null, telemetryOverride = null) {
     if (!this.ringBuffer) throw new Error('No audio buffer available');
 
-    const captureSeconds = Math.min(BUFFER_SECONDS, (this.samplesWritten || 0) / SAMPLE_RATE || BUFFER_SECONDS);
+    const bufferedSeconds = (this.samplesWritten || 0) / SAMPLE_RATE;
+    if (bufferedSeconds < MIN_CAPTURE_SECONDS) {
+      const waitMs = Math.ceil((MIN_CAPTURE_SECONDS - bufferedSeconds) * 1000);
+      console.log(`[ESP WS] Waiting ${waitMs}ms for minimum audio buffer (${bufferedSeconds.toFixed(2)}s available)`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+
+    const captureSeconds = Math.min(BUFFER_SECONDS, Math.max(MIN_CAPTURE_SECONDS, (this.samplesWritten || 0) / SAMPLE_RATE || BUFFER_SECONDS));
     const totalSamples = this._extractLastSamples(captureSeconds);
 
     if (totalSamples.length === 0) {
@@ -169,7 +178,16 @@ class EspWebsocketService {
     console.log('[ESP WS] WAV written to', uri);
 
     // Upload using recordingsService helper
-    const result = await uploadRecordingFile(userUid, uri, filename, totalSamples.length / SAMPLE_RATE, this.latestTelemetry || null, frontImageUri, backImageUri);
+    const telemetryForUpload = telemetryOverride || this.latestTelemetry || null;
+    const result = await uploadRecordingFile(
+      userUid,
+      uri,
+      filename,
+      totalSamples.length / SAMPLE_RATE,
+      telemetryForUpload,
+      frontImageUri,
+      backImageUri
+    );
     // cleanup
     try { await FileSystem.deleteAsync(uri); } catch (e) {}
     return result;

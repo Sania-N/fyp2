@@ -3,8 +3,8 @@
 // Example: 192.168.1.100, 192.168.137.1, etc.
 // Use 127.0.0.1 or localhost ONLY if running on same device as backend
 
-const LOCAL_IP = "10.252.136.166"; // ⚠️ CHANGE THIS TO YOUR BACKEND IP= 192.168.100.11  , 10.252.136.166
-const API_PORT = 8000;
+const LOCAL_IP = "10.28.50.166"; // ⚠️ CHANGE THIS TO YOUR BACKEND IP= 192.168.100.11  , 10.252.136.166
+const API_PORT = 8000;  
 
 export const API_BASE_URL = `http://${LOCAL_IP}:${API_PORT}`;
 

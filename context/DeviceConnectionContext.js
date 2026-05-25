@@ -41,7 +41,10 @@ export const DeviceConnectionProvider = ({ children }) => {
       const device = await WiFiDeviceService.connectToDevice(
         deviceIP,
         (telem) => {
-          if (telem) setTelemetry({ ...telem, receivedAt: Date.now() });
+          if (telem) {
+            EspWebsocketService.latestTelemetry = telem;
+            setTelemetry({ ...telem, receivedAt: Date.now() });
+          }
         },
         (reason) => {
           setConnectedDevice(null);
@@ -70,7 +73,10 @@ export const DeviceConnectionProvider = ({ children }) => {
 
   const disconnect = useCallback(() => {
     WiFiDeviceService.disconnect();
-    try { EspWebsocketService.disconnect(); } catch (e) {}
+    try {
+      EspWebsocketService.latestTelemetry = null;
+      EspWebsocketService.disconnect();
+    } catch (e) {}
     setConnectedDevice(null);
     setTelemetry(DEFAULT_TELEMETRY);
     setError(null);
@@ -78,13 +84,13 @@ export const DeviceConnectionProvider = ({ children }) => {
 
   const triggerEspCapture = useCallback(async (userUid, frontImageUri = null, backImageUri = null) => {
     try {
-      const res = await EspWebsocketService.captureAndUpload(userUid, frontImageUri, backImageUri);
+      const res = await EspWebsocketService.captureAndUpload(userUid, frontImageUri, backImageUri, telemetry);
       return res;
     } catch (e) {
       console.error('[Device] ESP capture/upload failed:', e);
       throw e;
     }
-  }, []);
+  }, [telemetry]);
 
   const value = {
     connectedDevice,

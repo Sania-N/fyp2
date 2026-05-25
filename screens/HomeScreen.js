@@ -380,7 +380,7 @@ export default function HomeScreen() {
             <View style={styles.waveformWrap}>
               {waveformSamples.map((sample, index) => {
                 const normalized = Math.max(0, Math.min(100, Number(sample) || 0));
-                const barHeight = Math.max(6, (normalized / 100) * 58);
+                const barHeight = normalized > 0 ? Math.max(10, (normalized / 100) * 58) : 6;
                 const isPeak = index === waveformSamples.length - 1;
 
                 return (

@@ -64,12 +64,12 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
       const calibStatus = threatTriggerService.getCalibrationStatus();
       if (!calibStatus.isCalibrated) {
         setCalibrationStatus(`Calibrating: ${calibStatus.remainingSeconds}s remaining`);
-        return;
-      }
-
-      if (calibrationStatus !== 'complete') {
-        setCalibrationStatus('complete');
-        console.log('✅ [RealtimeThreat] Calibration complete!');
+        // do not return here — allow motion and loud-sound triggers during calibration
+      } else {
+        if (calibrationStatus !== 'complete') {
+          setCalibrationStatus('complete');
+          console.log('✅ [RealtimeThreat] Calibration complete!');
+        }
       }
 
       const confidence = threatTriggerService.shouldCaptureAudio(triggers);
@@ -250,9 +250,27 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
       //   }
       // })();
 
-      // Still show danger alert even if not saving to DB
-      if (dangerContext?.showDangerAlert && isDangerRisk(threatRecord.risk_level)) {
-        dangerContext.showDangerAlert();
+      // Ensure danger popup is shown when a dangerous threat is detected.
+      if (isDangerRisk(threatRecord.risk_level)) {
+        // Inhibit further triggers until popup is handled (60s)
+        try {
+          if (typeof threatTriggerService.inhibit === 'function') {
+            threatTriggerService.inhibit(60000); // 60s
+            console.log('[RealtimeThreat] Trigger inhibition enabled for 60s after detection');
+          }
+        } catch (e) {
+          console.warn('[RealtimeThreat] Failed to inhibit triggers after detection:', e);
+        }
+
+        if (dangerContext && typeof dangerContext.showDangerAlert === 'function') {
+          try {
+            dangerContext.showDangerAlert();
+          } catch (err) {
+            console.warn('[RealtimeThreat] Failed to show danger alert:', err);
+          }
+        } else {
+          console.warn('[RealtimeThreat] Danger detected but DangerAlertContext unavailable.');
+        }
       }
     },
     [dangerContext]
