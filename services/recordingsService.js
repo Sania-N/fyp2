@@ -18,6 +18,14 @@ import {
 import { API_BASE_URL } from "../api";
 import { analyzeUserDangerLevel } from "./dangerDetectionService";
 
+function serializeLog(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (error) {
+    return JSON.stringify({ serializationError: error?.message || String(error) }, null, 2);
+  }
+}
+
 const getSupabaseClient = () => {
   if (!supabase) {
     throw new Error('Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY to enable recording uploads.');
@@ -120,13 +128,20 @@ export async function uploadRecording(
 
     // 1️⃣ Create Firestore doc first
     console.log('📝 Creating Firestore document...');
+    const audioStoragePath = storagePath;
+    const frontImageStoragePath = frontImageUri ? `recordings/${userUid}/${ts}/images/${userUid}_${ts}_front.jpg` : null;
+    const backImageStoragePath = backImageUri ? `recordings/${userUid}/${ts}/images/${userUid}_${ts}_back.jpg` : null;
+    
     const docRef = await addDoc(collection(db, "recordings"), {
       user_uid: userUid,
       filename,
       audio_url: audioUrl,
+      audio_storage_path: audioStoragePath,
       duration,
       front_image_url: images.front_image_url || null,
+      front_image_storage_path: frontImageStoragePath,
       back_image_url: images.back_image_url || null,
+      back_image_storage_path: backImageStoragePath,
       created_at: serverTimestamp(),
       emotion: null,
       confidence: null,
@@ -135,15 +150,22 @@ export async function uploadRecording(
       hardware_context: esp32Telemetry || null,  // ✅ NEW
     });
     console.log('✅ Firestore doc created:', docRef.id);
+    console.log('[RecordingFlow] Firestore recordingId:', docRef.id);
 
     // 2️⃣ CALL FASTAPI WITH HARDWARE CONTEXT
     console.log('🧠 Calling detectEmotion with ESP32 context:', {
       audioUrl,
-      esp32Available: !!esp32Telemetry
+      esp32Available: !!esp32Telemetry,
+      recordingId: docRef.id,
     });
     let result = null;
     try {
-      result = await detectEmotion(audioUrl, esp32Telemetry);  // ✅ Pass telemetry
+      result = await detectEmotion(audioUrl, esp32Telemetry, {
+        recordingId: docRef.id,
+        currentScreenOrFeature: 'RecordScreen.uploadRecording',
+        triggerSource: 'recording_upload',
+        requestReason: 'Recording uploaded and ready for emotion/threat analysis',
+      });  // ✅ Pass telemetry
       console.log('✅ ML result received:', result);
     } catch (mlError) {
       console.warn('⚠️ ML detection failed, keeping recording saved:', mlError.message || mlError);
@@ -162,12 +184,23 @@ export async function uploadRecording(
     }
 
     console.log('🎉 uploadRecording COMPLETE');
+    console.log('[RecordingFlow][FINAL SUMMARY]');
+    console.log(serializeLog({
+      timestamp: new Date().toISOString(),
+      recordingId: docRef.id,
+      emotion: result?.emotion ?? null,
+      confidence: result?.confidence ?? null,
+      panic: result?.panic ?? false,
+      risk_level: result?.risk_level ?? null,
+      trigger_reason: 'Recording uploaded and analyzed',
+    }));
     return {
       recordingId: docRef.id,
       audioUrl,
       emotion: result?.emotion ?? null,
       confidence: result?.confidence ?? null,
       panic: result?.panic ?? false,
+      risk_level: result?.risk_level ?? null,
       threatLevel: result?.risk_level ?? null,  // ✅ NEW
       hardwareContext: esp32Telemetry,  // ✅ NEW
     };
@@ -233,9 +266,16 @@ export async function uploadRecordingFile(
       hardware_context: esp32Telemetry || null,
     });
 
+    console.log('[RecordingFlow] Firestore recordingId (file upload):', docRef.id);
+
     let result = null;
     try {
-      result = await detectEmotion(audioUrl, esp32Telemetry);
+      result = await detectEmotion(audioUrl, esp32Telemetry, {
+        recordingId: docRef.id,
+        currentScreenOrFeature: 'uploadRecordingFile',
+        triggerSource: 'recording_file_upload',
+        requestReason: 'File upload ready for emotion/threat analysis',
+      });
     } catch (mlError) {
       console.warn('⚠️ ML detection failed (file upload):', mlError.message || mlError);
     }
@@ -255,6 +295,7 @@ export async function uploadRecordingFile(
       emotion: result?.emotion ?? null,
       confidence: result?.confidence ?? null,
       panic: result?.panic ?? false,
+      risk_level: result?.risk_level ?? null,
       threatLevel: result?.risk_level ?? null,
       hardwareContext: esp32Telemetry,
     };
@@ -270,9 +311,19 @@ export async function uploadRecordingFile(
  * @param {object} esp32Telemetry - Hardware sensor data (heart rate, motion, audio level)
  * @returns {Promise<{emotion, confidence, panic, risk_level}>}
  */
-export async function detectEmotion(audioUrl, esp32Telemetry = null) {
+export async function detectEmotion(audioUrl, esp32Telemetry = null, debugContext = {}) {
   try {
-    console.log('🧠 [detectEmotion] Starting with:', { audioUrl, esp32Telemetry: !!esp32Telemetry });
+    console.log('🧠 [detectEmotion] Starting with:', { audioUrl, esp32Telemetry: !!esp32Telemetry, debugContext });
+    console.log('[RealtimeThreat][STEP 1] Realtime check started');
+    console.log(serializeLog({
+      timestamp: new Date().toISOString(),
+      currentScreenOrFeature: debugContext.currentScreenOrFeature || 'recordingsService.detectEmotion',
+      triggerSource: debugContext.triggerSource || 'unknown',
+      captureArmed: true,
+      audioCaptureActive: false,
+      currentSensorSnapshot: esp32Telemetry || null,
+      recordingId: debugContext.recordingId || null,
+    }));
 
     if (esp32Telemetry) {
       console.log('📊 [detectEmotion] Calling /realtime-threat endpoint...');
@@ -282,6 +333,16 @@ export async function detectEmotion(audioUrl, esp32Telemetry = null) {
         Number.isFinite(esp32Telemetry.roll) &&
         Number.isFinite(esp32Telemetry.pitch) &&
         Number.isFinite(esp32Telemetry.yaw);
+      const dampedYaw = (Number(esp32Telemetry.yaw) || 0) * 0.35;
+      const motionMagnitude = hasDirectMotion
+        ? esp32Telemetry.motion
+        : hasImuAngles
+          ? Math.sqrt(
+              (esp32Telemetry.roll || 0) * (esp32Telemetry.roll || 0) +
+              (esp32Telemetry.pitch || 0) * (esp32Telemetry.pitch || 0) +
+              dampedYaw * dampedYaw
+            )
+          : 0;
 
       const motion = hasDirectMotion
         ? esp32Telemetry.motion
@@ -289,12 +350,24 @@ export async function detectEmotion(audioUrl, esp32Telemetry = null) {
           ? Math.sqrt(
               (esp32Telemetry.roll || 0) * (esp32Telemetry.roll || 0) +
               (esp32Telemetry.pitch || 0) * (esp32Telemetry.pitch || 0) +
-              (esp32Telemetry.yaw || 0) * (esp32Telemetry.yaw || 0)
+              dampedYaw * dampedYaw
             )
           : 0;
 
       const heartRateValue = Number(esp32Telemetry.heartRate);
       const heartRate = Number.isFinite(heartRateValue) && heartRateValue > 0 ? heartRateValue : 0;
+      const requestUrl = `${API_BASE_URL}/realtime-threat`;
+      const requestHeaders = {
+        'Content-Type': 'application/json',
+        'x-trigger-source': 'realtime',
+        'x-realtime': 'true',
+      };
+      const requestBody = {
+        audio_url: audioUrl,
+        motion,
+        heart_rate: heartRate,
+        trigger_reason: debugContext.requestReason || 'recording_upload',
+      };
 
       console.log('📡 [detectEmotion] Hardware payload to /realtime-threat:', {
         motion,
@@ -305,26 +378,59 @@ export async function detectEmotion(audioUrl, esp32Telemetry = null) {
         yaw: esp32Telemetry.yaw,
       });
 
-      const combinedResponse = await fetch(`${API_BASE_URL}/realtime-threat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-trigger-source': 'realtime',
-          'x-realtime': 'true',
-        },
-        body: JSON.stringify({
-          audio_url: audioUrl,
+      console.log('[RealtimeThreat][STEP 2] Right before the request is sent');
+      console.log(serializeLog({
+        timestamp: new Date().toISOString(),
+        endpointUrl: requestUrl,
+        requestHeaders,
+        fullRequestBody: requestBody,
+        localComputedValues: {
+          motionMagnitude,
           motion,
-          heart_rate: heartRate,
-          trigger_reason: 'recording_upload',
-        }),
+          heartRateValue,
+          heartRate,
+          esp32Telemetry,
+          debugContext,
+        },
+        exactReasonRequestIsBeingSent: debugContext.requestReason || 'ESP32 hardware data available for combined realtime analysis',
+      }));
+
+      const requestStartAt = Date.now();
+      const combinedResponse = await fetch(requestUrl, {
+        method: 'POST',
+        headers: requestHeaders,
+        body: JSON.stringify(requestBody),
       });
+
+      const responseTimeMs = Date.now() - requestStartAt;
+      const rawResponseBody = await combinedResponse.text();
+      let parsedResponse = null;
+      let parsingError = null;
+      try {
+        parsedResponse = rawResponseBody ? JSON.parse(rawResponseBody) : null;
+      } catch (error) {
+        parsingError = error?.message || String(error);
+      }
+
+      console.log('[RealtimeThreat][STEP 3] Right after the request returns');
+      console.log(serializeLog({
+        timestamp: new Date().toISOString(),
+        httpStatusCode: combinedResponse.status,
+        responseTimeMs,
+        rawResponseBody,
+        parsedJsonResponse: parsedResponse,
+        parsingError,
+      }));
 
       if (!combinedResponse.ok) {
         throw new Error(`Realtime threat detection failed: ${combinedResponse.status}`);
       }
 
-      const combinedData = await combinedResponse.json();
+      if (parsingError) {
+        throw new Error(`Realtime threat detection response parsing failed: ${parsingError}`);
+      }
+
+      const combinedData = parsedResponse;
       console.log('📊 [detectEmotion] Realtime threat result:', combinedData);
 
       return {
@@ -338,22 +444,66 @@ export async function detectEmotion(audioUrl, esp32Telemetry = null) {
         timestamp: combinedData.timestamp || new Date().toISOString(),
         hardware_data_used: true,
         sensor_context: esp32Telemetry,
+        recordingId: debugContext.recordingId || null,
       };
     }
 
     // Step 1: Get emotion from audio
     console.log('📊 [detectEmotion] Calling /predict endpoint...');
-    const emotionResponse = await fetch(`${API_BASE_URL}/predict`, {
+    const emotionRequestUrl = `${API_BASE_URL}/predict`;
+    const emotionRequestHeaders = { 'Content-Type': 'application/json' };
+    const emotionRequestBody = { audio_url: audioUrl };
+
+    console.log('[RealtimeThreat][STEP 2] Right before the request is sent');
+    console.log(serializeLog({
+      timestamp: new Date().toISOString(),
+      endpointUrl: emotionRequestUrl,
+      requestHeaders: emotionRequestHeaders,
+      fullRequestBody: emotionRequestBody,
+      localComputedValues: {
+        audioUrl,
+        recordingId: debugContext.recordingId || null,
+        debugContext,
+      },
+      exactReasonRequestIsBeingSent: debugContext.requestReason || 'No ESP32 telemetry available; requesting audio emotion only',
+    }));
+
+    const emotionRequestStartAt = Date.now();
+    const emotionResponse = await fetch(emotionRequestUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audio_url: audioUrl }),
+      headers: emotionRequestHeaders,
+      body: JSON.stringify(emotionRequestBody),
     });
+
+    const emotionResponseTimeMs = Date.now() - emotionRequestStartAt;
+    const emotionRawResponseBody = await emotionResponse.text();
+    let emotionParsedResponse = null;
+    let emotionParsingError = null;
+    try {
+      emotionParsedResponse = emotionRawResponseBody ? JSON.parse(emotionRawResponseBody) : null;
+    } catch (error) {
+      emotionParsingError = error?.message || String(error);
+    }
+
+    console.log('[RealtimeThreat][STEP 3] Right after the request returns');
+    console.log(serializeLog({
+      timestamp: new Date().toISOString(),
+      httpStatusCode: emotionResponse.status,
+      responseTimeMs: emotionResponseTimeMs,
+      rawResponseBody: emotionRawResponseBody,
+      parsedJsonResponse: emotionParsedResponse,
+      parsingError: emotionParsingError,
+    }));
 
     if (!emotionResponse.ok) {
       throw new Error(`Emotion detection failed: ${emotionResponse.status}`);
     }
 
-    const emotionData = await emotionResponse.json();
+    if (emotionParsingError) {
+      throw new Error(`Emotion detection response parsing failed: ${emotionParsingError}`);
+    }
+
+    const emotionData = emotionParsedResponse;
     console.log('📊 [detectEmotion] Audio emotion result:', emotionData);
 
     const emotionConfidence = emotionData.confidence;
@@ -365,12 +515,14 @@ export async function detectEmotion(audioUrl, esp32Telemetry = null) {
     if (esp32Telemetry) {
       console.log('✅ [detectEmotion] Using REAL ESP32 hardware data');
       threatData = await analyzeUserDangerLevel(
-        emotionConfidence, 
-        esp32Telemetry  // ✅ Pass real sensor data
+        emotionConfidence,
+        esp32Telemetry,  // ✅ Pass real sensor data
+        debugContext,
+        emotionData?.emotion || null
       );
     } else {
       console.log('⚠️ [detectEmotion] No ESP32 data, using fallback mode');
-      threatData = await analyzeUserDangerLevel(emotionConfidence);  // Fallback
+      threatData = await analyzeUserDangerLevel(emotionConfidence, null, debugContext, emotionData?.emotion || null);  // Fallback
     }
 
     console.log('🚨 [detectEmotion] Threat analysis result:', threatData);
@@ -381,6 +533,7 @@ export async function detectEmotion(audioUrl, esp32Telemetry = null) {
       ...threatData,
       hardware_data_used: !!esp32Telemetry,
       sensor_context: esp32Telemetry || null,
+      recordingId: debugContext.recordingId || null,
     };
 
     console.log('✅ [detectEmotion] Final combined result:', finalResult);
@@ -407,28 +560,88 @@ export function listenUserRecordings(userUid, onUpdate) {
 }
 
 /* ============================================================
-  DELETE FILES + FIRESTORE DOC
-  deleteRecording(id, filename, audioURL, frontURL?, backURL?)
+  DELETE RECORDING: Firestore + Supabase Storage
+  Handles both stored paths (new method) and path reconstruction (fallback)
 ============================================================ */
-export async function deleteRecording(id, filename, audioURL, frontURL, backURL) {
+export async function deleteRecording(id, filename, audioURL, frontURL, backURL, audioStoragePath = null, frontStoragePath = null, backStoragePath = null) {
   try {
+    console.log('🗑️  deleteRecording START:', { 
+      id, 
+      filename, 
+      useStoredPaths: !!(audioStoragePath || frontStoragePath || backStoragePath)
+    });
+    
     const supabaseClient = getSupabaseClient();
-    const user = filename.split("_")[0];
-    const ts = filename.split("_")[1].split(".")[0];
-    const base = `recordings/${user}/${ts}/`;
+    const files = [];
 
-    const files = [`${base}audio/${filename}`];
+    // ✅ Method 1: Use stored storage paths (preferred - more reliable)
+    if (audioStoragePath) {
+      files.push(audioStoragePath);
+      console.log('📄 Using stored audio path:', audioStoragePath);
+    } else {
+      // ⚠️ Fallback: Reconstruct path from filename
+      console.log('⚠️  audioStoragePath not provided, reconstructing from filename...');
+      const filenameParts = filename.split("_");
+      if (filenameParts.length < 2) {
+        throw new Error(`Invalid filename format: ${filename}. Expected format: userUID_timestamp.m4a`);
+      }
+      const user = filenameParts[0];
+      const ts = filenameParts[1].split(".")[0];
+      files.push(`recordings/${user}/${ts}/audio/${filename}`);
+    }
 
-    if (frontURL) files.push(`${base}images/${frontURL.split("/").pop()}`);
-    if (backURL) files.push(`${base}images/${backURL.split("/").pop()}`);
+    if (frontStoragePath) {
+      files.push(frontStoragePath);
+      console.log('🖼️  Using stored front image path:', frontStoragePath);
+    } else if (frontURL && typeof frontURL === 'string') {
+      console.log('⚠️  frontStoragePath not provided, extracting from URL...');
+      const filenameParts = filename.split("_");
+      const user = filenameParts[0];
+      const ts = filenameParts[1].split(".")[0];
+      files.push(`recordings/${user}/${ts}/images/${frontURL.split("/").pop()}`);
+    }
 
-    // supabase remove expects array of paths
-    await supabaseClient.storage.from("recordings").remove(files);
+    if (backStoragePath) {
+      files.push(backStoragePath);
+      console.log('🖼️  Using stored back image path:', backStoragePath);
+    } else if (backURL && typeof backURL === 'string') {
+      console.log('⚠️  backStoragePath not provided, extracting from URL...');
+      const filenameParts = filename.split("_");
+      const user = filenameParts[0];
+      const ts = filenameParts[1].split(".")[0];
+      files.push(`recordings/${user}/${ts}/images/${backURL.split("/").pop()}`);
+    }
 
-    // delete firestore doc
+    if (files.length === 0) {
+      console.warn('⚠️  No files to delete from storage');
+    } else {
+      console.log('🚀 Deleting from Supabase storage:', files);
+      const { data: storageData, error: storageError } = await supabaseClient.storage
+        .from("recordings")
+        .remove(files);
+      
+      if (storageError) {
+        console.error('❌ Supabase storage deletion error:', storageError);
+        // Don't throw - continue to delete Firestore doc
+        console.log('⚠️  Continuing with Firestore deletion despite storage error');
+      } else {
+        console.log('✅ Files deleted from Supabase storage');
+      }
+    }
+
+    // Delete Firestore document
+    console.log('🗑️  Deleting Firestore document:', id);
     await deleteDoc(doc(db, "recordings", id));
+    console.log('✅ Firestore document deleted');
+    
+    console.log('✅ deleteRecording COMPLETE');
+    
   } catch (err) {
-    console.error("deleteRecording failed", err);
+    console.error("❌ deleteRecording FAILED:", {
+      errorMessage: err.message,
+      errorCode: err.code,
+      fullError: err
+    });
     throw err;
   }
 }
@@ -438,4 +651,81 @@ export async function deleteRecording(id, filename, audioURL, frontURL, backURL)
 ============================================================ */
 export async function renameRecording(id, newName) {
   await updateDoc(doc(db, "recordings", id), { filename: newName });
+}
+
+/* ============================================================
+  MIGRATE OLD RECORDINGS - Add storage paths to existing docs
+  This helps fix deletion issues for recordings created before storage paths were stored
+  Returns: { success: number, failed: number, skipped: number }
+============================================================ */
+export async function migrateOldRecordings(userUid) {
+  try {
+    console.log('🔄 Starting migration for user:', userUid);
+    
+    const q = query(
+      collection(db, "recordings"),
+      where("user_uid", "==", userUid)
+    );
+    
+    const querySnapshot = await getDocs(q);
+    let success = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    for (const docSnapshot of querySnapshot.docs) {
+      const recording = docSnapshot.data();
+      
+      // Skip if storage paths already exist
+      if (recording.audio_storage_path && recording.back_image_storage_path) {
+        console.log(`⏭️  Skipping ${docSnapshot.id} - paths already exist`);
+        skipped++;
+        continue;
+      }
+
+      try {
+        const filenameParts = recording.filename?.split("_") || [];
+        if (filenameParts.length < 2) {
+          console.warn(`❌ Cannot migrate ${docSnapshot.id} - invalid filename format`);
+          failed++;
+          continue;
+        }
+
+        const user = filenameParts[0];
+        const ts = filenameParts[1].split(".")[0];
+
+        const updates = {};
+        
+        // Add audio path if missing
+        if (!recording.audio_storage_path) {
+          updates.audio_storage_path = `recordings/${user}/${ts}/audio/${recording.filename}`;
+        }
+        
+        // Add image paths if missing
+        if (!recording.front_image_storage_path && recording.front_image_url) {
+          updates.front_image_storage_path = `recordings/${user}/${ts}/images/${user}_${ts}_front.jpg`;
+        }
+        
+        if (!recording.back_image_storage_path && recording.back_image_url) {
+          updates.back_image_storage_path = `recordings/${user}/${ts}/images/${user}_${ts}_back.jpg`;
+        }
+
+        if (Object.keys(updates).length > 0) {
+          await updateDoc(doc(db, "recordings", docSnapshot.id), updates);
+          console.log(`✅ Migrated ${docSnapshot.id}:`, updates);
+          success++;
+        } else {
+          skipped++;
+        }
+      } catch (err) {
+        console.error(`❌ Failed to migrate ${docSnapshot.id}:`, err);
+        failed++;
+      }
+    }
+
+    console.log('🎉 Migration complete:', { success, failed, skipped });
+    return { success, failed, skipped };
+  } catch (err) {
+    console.error('❌ Migration failed:', err);
+    throw err;
+  }
 }

@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "my-app",
-    "slug": "my-app",
+    "name": "safety-app",
+    "slug": "safety-app",
     "sdkVersion": "54.0.0",
     "version": "1.0.0",
     "orientation": "portrait",

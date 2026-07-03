@@ -8,6 +8,7 @@ const DEFAULT_TELEMETRY = {
   roll: 0,
   pitch: 0,
   yaw: 0,
+  accelJerk: 0,
   heartRate: 0,
   spo2: 0,
   fingerOn: false,
@@ -82,9 +83,9 @@ export const DeviceConnectionProvider = ({ children }) => {
     setError(null);
   }, []);
 
-  const triggerEspCapture = useCallback(async (userUid, frontImageUri = null, backImageUri = null) => {
+  const triggerEspCapture = useCallback(async (userUid, frontImageUri = null, backImageUri = null, captureContext = {}) => {
     try {
-      const res = await EspWebsocketService.captureAndUpload(userUid, frontImageUri, backImageUri, telemetry);
+      const res = await EspWebsocketService.captureAndUpload(userUid, frontImageUri, backImageUri, telemetry, captureContext);
       return res;
     } catch (e) {
       console.error('[Device] ESP capture/upload failed:', e);

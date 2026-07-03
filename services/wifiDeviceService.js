@@ -10,16 +10,16 @@ export class WiFiDeviceService {
   static didNotifyConnectionLost = false;
   static consecutivePollFailures = 0;
   static lastTelemetrySuccessAt = 0;
-  static POLL_FAILURE_THRESHOLD = 6;
-  static POLL_INTERVAL_MS = 1500; // increased to reduce request overlap
-  static TELEMETRY_TIMEOUT_MS = 3500; // allow more time for ESP32 responses
-  static MIN_STALE_MS_BEFORE_DISCONNECT = 15000; // slightly longer before disconnect
+  // static POLL_FAILURE_THRESHOLD = 20;
+  static POLL_INTERVAL_MS = 2500; // reduce overlap and give ESP32 more room
+  static TELEMETRY_TIMEOUT_MS = 8000; // telemetry endpoint can be slower than status
 
   // Telemetry structure matching ESP32 firmware
   static DEFAULT_TELEMETRY = {
     roll: 0,
     pitch: 0,
     yaw: 0,
+    accelJerk: 0,
     heartRate: 0,
     spo2: 0,
     fingerOn: false,
@@ -108,21 +108,12 @@ export class WiFiDeviceService {
 
         if (
           this.consecutivePollFailures >= this.POLL_FAILURE_THRESHOLD &&
-          staleForMs >= this.MIN_STALE_MS_BEFORE_DISCONNECT &&
           !this.didNotifyConnectionLost
         ) {
           this.didNotifyConnectionLost = true;
-          this.disconnect();
-
-          if (typeof onTelemetryUpdate === 'function') {
-            onTelemetryUpdate({ ...this.DEFAULT_TELEMETRY });
-          }
-
-          if (typeof onConnectionLost === 'function') {
-            onConnectionLost(
-              `Watch disconnected: telemetry endpoint not responding (${staleForMs}ms stale).`
-            );
-          }
+          console.warn(
+            `[WiFi Device] Telemetry still unavailable after ${this.consecutivePollFailures} attempts (${staleForMs}ms stale), keeping the device session alive.`
+          );
         }
       } finally {
         this.isPollRequestInFlight = false;
@@ -140,6 +131,7 @@ export class WiFiDeviceService {
         roll: parseFloat(data.roll) || 0,
         pitch: parseFloat(data.pitch) || 0,
         yaw: parseFloat(data.yaw) || 0,
+        accelJerk: parseFloat(data.accelJerk) || 0,
 
         // PPG (heart rate, SpO2, finger detection)
         heartRate: parseInt(data.heartRate) || 0,

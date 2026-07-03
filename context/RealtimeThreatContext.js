@@ -5,7 +5,7 @@
  * Provides: monitoring status, threat history, statistics
  */
 
-import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
+import React, { createContext, useContext, useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { useDeviceConnection } from './DeviceConnectionContext';
 import { DangerAlertContext } from './DangerAlertContext';
 import threatTriggerService from '../services/threatTriggerService';
@@ -15,6 +15,14 @@ import { isDangerRisk } from '../services/dangerDetectionService';
 import { addGeoFenceAlertHistoryItem } from '../services/geoFenceService';
 
 export const RealtimeThreatContext = createContext();
+
+const serializeLog = (value) => {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (error) {
+    return JSON.stringify({ serializationError: error?.message || String(error) }, null, 2);
+  }
+};
 
 export const RealtimeThreatProvider = ({ children, userUid }) => {
   // ════════════════════════════════════════
@@ -39,21 +47,54 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
   });
 
   const processingCaptureRef = useRef(false);
+  const lastIdleLogRef = useRef(0);
+  const lastProcessedTelemetryAtRef = useRef(0);
 
   // Get parent contexts
   const deviceContext = useDeviceConnection();
   const dangerContext = useContext(DangerAlertContext);
+  const dangerAlertVisible = Boolean(dangerContext?.isVisible);
+  const showDangerAlert = dangerContext?.showDangerAlert;
 
   const processTelemetry = useCallback(async (telemetry) => {
     try {
       if (!telemetry) return;
+
+      const telemetryReceivedAt = Number(telemetry.receivedAt) || 0;
+      if (telemetryReceivedAt && lastProcessedTelemetryAtRef.current === telemetryReceivedAt) {
+        return;
+      }
+      if (telemetryReceivedAt) {
+        lastProcessedTelemetryAtRef.current = telemetryReceivedAt;
+      }
+
+      const currentScreenOrFeature = 'RealtimeMonitoringScreen / RealtimeThreatContext.processTelemetry';
+      const now = Date.now();
+      const shouldEmitVerboseIdleLog = now - lastIdleLogRef.current >= 10000;
+      const currentTimestamp = new Date().toISOString();
+      const sensorSnapshot = {
+        timestamp: currentTimestamp,
+        heartRate: telemetry.heartRate || 0,
+        roll: telemetry.roll || 0,
+        pitch: telemetry.pitch || 0,
+        yaw: telemetry.yaw || 0,
+        audioLevel: telemetry.audioLevel || 0,
+        fingerOn: telemetry.fingerOn,
+        spo2: telemetry.spo2,
+      };
+      const currentAudioStatus = typeof eventDrivenAudioCaptureService.getStatus === 'function'
+        ? eventDrivenAudioCaptureService.getStatus()
+        : { isRecording: false };
+      const currentTriggerState = typeof threatTriggerService.getDebugState === 'function'
+        ? threatTriggerService.getDebugState()
+        : {};
 
       setLiveMetrics({
         heartRate: telemetry.heartRate || 0,
         motionMagnitude: Math.sqrt(
           (telemetry.roll || 0) ** 2 +
           (telemetry.pitch || 0) ** 2 +
-          (telemetry.yaw || 0) ** 2
+          (((telemetry.yaw || 0) * 0.35) ** 2)
         ),
         audioLevel: telemetry.audioLevel || 0,
       });
@@ -72,52 +113,106 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
         }
       }
 
-      const confidence = threatTriggerService.shouldCaptureAudio(triggers);
+      const decisionContext = {
+        timestamp: currentTimestamp,
+        currentScreenOrFeature,
+        triggerSource: 'threatTriggerService.analyzeTelemetry',
+        currentSensorSnapshot: sensorSnapshot,
+        captureArmed: Boolean(isMonitoring) && !processingCaptureRef.current && !currentTriggerState?.inhibited,
+      };
+      const confidence = threatTriggerService.shouldCaptureAudio(triggers, decisionContext);
+      const triggerDecisionDebug = typeof threatTriggerService.getLastDecisionDebug === 'function'
+        ? threatTriggerService.getLastDecisionDebug()
+        : null;
 
-      // If the danger popup is visible, DO NOT initiate a new capture.
-      // Instead, record any triggers into the alert history so they are
-      // included in the SOS message context. This prevents overlapping
-      // captures while the user is dealing with the popup.
-      if (dangerContext?.isVisible) {
-        if (triggers && triggers.length > 0) {
-          try {
-            const alertMessage = triggers.map((t) => t.description).join(' ; ');
-            const details = {
-              reason: triggers.map((t) => t.type).join(', '),
-              triggerCount: triggers.length,
-              motion: liveMetrics.motionMagnitude,
-              heartRate: liveMetrics.heartRate,
-              audioLevel: liveMetrics.audioLevel,
-            };
-            await addGeoFenceAlertHistoryItem({
-              message: `During active alert: ${alertMessage}`,
-              timestamp: new Date().toISOString(),
-              details,
-              eventType: 'threat_during_popup',
-            });
-            console.log('ℹ️ [RealtimeThreat] Popup visible — logged trigger to alert history, skipping capture');
-          } catch (err) {
-            console.warn('⚠️ [RealtimeThreat] Failed to log trigger during popup:', err);
-          }
-        }
+      const shouldLogVerboseDecision = Boolean(confidence) || triggers.length > 0 || shouldEmitVerboseIdleLog;
 
-        // Do not proceed with capture while popup is visible
-        return;
+      if (shouldLogVerboseDecision) {
+        console.log('[RealtimeThreat][STEP 1] Realtime check started');
+        console.log(serializeLog({
+          timestamp: currentTimestamp,
+          currentScreenOrFeature,
+          triggerSource: 'telemetry_monitoring_loop',
+          captureArmed: Boolean(isMonitoring) && !processingCaptureRef.current && !currentTriggerState?.inhibited,
+          audioCaptureActive: Boolean(currentAudioStatus?.isRecording),
+          currentSensorSnapshot: sensorSnapshot,
+          triggerState: currentTriggerState,
+        }));
+
+        console.log('[RealtimeThreat][STEP 4] Frontend decision logic after trigger evaluation');
+        console.log(serializeLog({
+          timestamp: new Date().toISOString(),
+          responseTreatedAsThreat: Boolean(confidence),
+          exactConditionThatCausedDecision: triggerDecisionDebug?.reason || (confidence ? `Capture allowed with confidence ${confidence}` : 'No capture condition matched'),
+          captureSkippedOrTriggered: confidence ? 'triggered' : 'skipped',
+          confidence,
+          triggerTypes: triggers.map((trigger) => trigger.type),
+          triggerDescriptions: triggers.map((trigger) => trigger.description),
+          triggerCounts: triggerDecisionDebug?.triggerCounts || currentTriggerState?.triggerCounts,
+          cooldownRemainingMs: triggerDecisionDebug?.cooldownRemainingMs ?? currentTriggerState?.cooldownRemainingMs,
+          cooldownMs: currentTriggerState?.triggerCooldownMs,
+          inhibited: triggerDecisionDebug?.inhibited ?? currentTriggerState?.inhibited,
+        }));
       }
+
+      const logFinalSummary = (summary) => {
+        console.log('[RealtimeThreat][FINAL SUMMARY]');
+        console.log(serializeLog({
+          timestamp: new Date().toISOString(),
+          ...summary,
+        }));
+      };
 
       // STRICT GATE: No capture without a trigger OR if already processing
       if (!confidence) {
-        console.log('ℹ️ [RealtimeThreat] No threat detected - SKIPPING capture');
+        if (shouldEmitVerboseIdleLog) {
+          console.log('ℹ️ [RealtimeThreat] No threat detected - SKIPPING capture');
+          lastIdleLogRef.current = now;
+          logFinalSummary({
+            wasThreatDetected: false,
+            wasCaptureTriggered: false,
+            wasUploadSkipped: true,
+            exactConditionThatDecidedIt: triggerDecisionDebug?.reason || 'threatTriggerService.shouldCaptureAudio returned null',
+            triggerSource: 'threatTriggerService.analyzeTelemetry',
+            triggerTypes: triggers.map((trigger) => trigger.type),
+            cooldownRemainingMs: triggerDecisionDebug?.cooldownRemainingMs ?? currentTriggerState?.cooldownRemainingMs,
+            triggerCounts: triggerDecisionDebug?.triggerCounts || currentTriggerState?.triggerCounts,
+          });
+        }
         return;
       }
       
       if (processingCaptureRef.current) {
-        console.log('⏳ [RealtimeThreat] Already processing a capture - SKIPPING');
+        if (shouldEmitVerboseIdleLog) {
+          console.log('⏳ [RealtimeThreat] Already processing a capture - SKIPPING');
+          lastIdleLogRef.current = now;
+          logFinalSummary({
+            wasThreatDetected: false,
+            wasCaptureTriggered: false,
+            wasUploadSkipped: true,
+            exactConditionThatDecidedIt: 'processingCaptureRef.current was already true',
+            triggerSource: 'telemetry_monitoring_loop',
+            triggerTypes: triggers.map((trigger) => trigger.type),
+            cooldownRemainingMs: triggerDecisionDebug?.cooldownRemainingMs ?? currentTriggerState?.cooldownRemainingMs,
+            triggerCounts: triggerDecisionDebug?.triggerCounts || currentTriggerState?.triggerCounts,
+          });
+        }
         return;
       }
 
       processingCaptureRef.current = true;
       console.log(`🚨 [RealtimeThreat] ⚠️ TRIGGER DETECTED! ${confidence} confidence - capturing audio NOW`);
+
+      const captureDebugContext = {
+        currentScreenOrFeature,
+        triggerSource: 'threatTriggerService.shouldCaptureAudio',
+        triggerReason: triggerDecisionDebug?.reason || `Capture allowed with confidence ${confidence}`,
+        requestReason: triggerDecisionDebug?.reason || `Threat-triggered capture (${confidence})`,
+        captureArmed: true,
+        audioCaptureActive: Boolean(currentAudioStatus?.isRecording),
+        currentSensorSnapshot: sensorSnapshot,
+        triggerDecision: triggerDecisionDebug,
+      };
 
       // Inhibit other triggers while we capture + upload + analyze
       try {
@@ -135,8 +230,17 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
             console.log(`ℹ️ [RealtimeThreat] Waiting ${POST_CAPTURE_MS}ms to include post-trigger audio before extraction`);
             await new Promise((r) => setTimeout(r, POST_CAPTURE_MS));
 
-            const res = await deviceContext.triggerEspCapture(userUid);
-            handleThreatDetected(res, confidence);
+            const res = await deviceContext.triggerEspCapture(userUid, null, null, {
+              captureAllowed: Boolean(confidence),
+              triggerSource: 'threatTriggerService.shouldCaptureAudio',
+              triggerReason: triggerDecisionDebug?.reason || `Capture allowed with confidence ${confidence}`,
+              currentScreenOrFeature,
+              currentSensorSnapshot: sensorSnapshot,
+              triggerDecision: triggerDecisionDebug,
+            });
+            if (res) {
+              handleThreatDetected(res, confidence);
+            }
           } catch (espErr) {
             console.warn('[RealtimeThreat] ESP capture failed, falling back to phone mic:', espErr);
             await eventDrivenAudioCaptureService.captureAndAnalyze(
@@ -148,6 +252,8 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
               (error) => {
                 console.error('❌ [RealtimeThreat] Threat analysis failed (fallback):', error);
               }
+              ,
+              captureDebugContext
             );
           }
         } else {
@@ -160,6 +266,8 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
             (error) => {
               console.error('❌ [RealtimeThreat] Threat analysis failed:', error);
             }
+            ,
+            captureDebugContext
           );
         }
       } finally {
@@ -179,7 +287,7 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
     } finally {
       processingCaptureRef.current = false;
     }
-  }, [calibrationStatus, dangerContext, userUid]);
+  }, [calibrationStatus, dangerAlertVisible, showDangerAlert, userUid]);
 
   // ════════════════════════════════════════
   // MONITORING LOOP (Main Logic)
@@ -195,6 +303,8 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
     setIsMonitoring(true);
     setCalibrationStatus('calibrating');
     setRecentTriggers([]);
+    lastIdleLogRef.current = 0;
+    lastProcessedTelemetryAtRef.current = 0;
     threatTriggerService.resetCalibration();
   }, [isMonitoring]);
 
@@ -203,6 +313,8 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
     setIsMonitoring(false);
     setCalibrationStatus('idle');
     setRecentTriggers([]);
+    lastIdleLogRef.current = 0;
+    lastProcessedTelemetryAtRef.current = 0;
   }, []);
 
   // ════════════════════════════════════════
@@ -211,7 +323,31 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
 
   const handleThreatDetected = useCallback(
     (threatResult, confidence) => {
-      console.log('🚨 [RealtimeThreat] Threat detected:', threatResult);
+      const normalizedRiskLevel = threatResult?.risk_level || threatResult?.threatLevel || null;
+      const normalizedEmotion = threatResult?.emotion ?? null;
+      const normalizedConfidence = threatResult?.confidence ?? null;
+
+      if (!threatResult || normalizedConfidence == null || !normalizedRiskLevel) {
+        console.warn('⚠️ [RealtimeThreat] Ignoring incomplete threat result:', threatResult);
+        return;
+      }
+
+      if (!isDangerRisk(normalizedRiskLevel)) {
+        console.log('ℹ️ [RealtimeThreat] Non-danger result received, not treating as threat:', {
+          risk_level: normalizedRiskLevel,
+          emotion: normalizedEmotion,
+          confidence: normalizedConfidence,
+          panic: threatResult?.panic ?? null,
+        });
+        return;
+      }
+
+      console.log('🚨 [RealtimeThreat] Threat detected:', {
+        ...threatResult,
+        risk_level: normalizedRiskLevel,
+        emotion: normalizedEmotion,
+        confidence: normalizedConfidence,
+      });
 
       // Add to history
       const threatRecord = {
@@ -219,9 +355,9 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
         timestamp: new Date().toISOString(),
         confidence: confidence,
         audio_url: threatResult.audio_url,
-        emotion: threatResult.emotion,
-        emotion_confidence: threatResult.confidence,
-        risk_level: threatResult.risk_level,
+        emotion: normalizedEmotion,
+        emotion_confidence: normalizedConfidence,
+        risk_level: normalizedRiskLevel,
         heart_rate: threatResult.heart_rate,
         motion: threatResult.motion,
       };
@@ -262,14 +398,14 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
           console.warn('[RealtimeThreat] Failed to inhibit triggers after detection:', e);
         }
 
-        if (dangerContext && typeof dangerContext.showDangerAlert === 'function') {
+        if (!dangerAlertVisible && typeof showDangerAlert === 'function') {
           try {
-            dangerContext.showDangerAlert();
+            showDangerAlert();
           } catch (err) {
             console.warn('[RealtimeThreat] Failed to show danger alert:', err);
           }
         } else {
-          console.warn('[RealtimeThreat] Danger detected but DangerAlertContext unavailable.');
+          console.log('[RealtimeThreat] Danger popup already visible, skipping duplicate alert.');
         }
       }
     },
@@ -311,7 +447,18 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
   // CONTEXT VALUE
   // ════════════════════════════════════════
 
-  const value = {
+  const clearThreatHistory = useCallback(() => setThreats([]), []);
+
+  const resetStats = useCallback(() => {
+    setStats({
+      totalCaptures: 0,
+      highRiskCount: 0,
+      mediumRiskCount: 0,
+      avgProcessingTime: 0,
+    });
+  }, []);
+
+  const value = useMemo(() => ({
     // State
     isMonitoring,
     lastThreatDetected,
@@ -326,18 +473,25 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
     stopMonitoring,
 
     // Utilities
-    clearThreatHistory: () => setThreats([]),
-    resetStats: () =>
-      setStats({
-        totalCaptures: 0,
-        highRiskCount: 0,
-        mediumRiskCount: 0,
-        avgProcessingTime: 0,
-      }),
+    clearThreatHistory,
+    resetStats,
 
     // Direct threat trigger (for testing)
     triggerThreatManually: handleThreatDetected,
-  };
+  }), [
+    isMonitoring,
+    lastThreatDetected,
+    threats,
+    recentTriggers,
+    stats,
+    liveMetrics,
+    calibrationStatus,
+    startMonitoring,
+    stopMonitoring,
+    clearThreatHistory,
+    resetStats,
+    handleThreatDetected,
+  ]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -352,7 +506,7 @@ export const RealtimeThreatProvider = ({ children, userUid }) => {
     if (!isMonitoring) return;
     if (!deviceContext?.telemetry) return;
     processTelemetry(deviceContext.telemetry);
-  }, [deviceContext?.telemetry, isMonitoring, processTelemetry]);
+  }, [deviceContext?.telemetry?.receivedAt, isMonitoring]);
 
   useEffect(() => {
     const connected = Boolean(deviceContext?.connectedDevice);

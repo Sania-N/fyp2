@@ -11,12 +11,12 @@ import { getGeoFenceAlertHistory } from './geoFenceService';
  * @param {string} phone - Phone number to format
  * @returns {string} Formatted phone number
  */
-const formatPhoneForWhatsApp = (phone) => {
+export const formatPhoneForWhatsApp = (phone) => {
   const cleaned = phone.replace(/[^\d]/g, '');
   return cleaned.replace(/^\+/, '');
 };
 
-const isSameLocalDay = (timestamp, referenceDate = new Date()) => {
+export const isSameLocalDay = (timestamp, referenceDate = new Date()) => {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return false;
 
@@ -27,12 +27,12 @@ const isSameLocalDay = (timestamp, referenceDate = new Date()) => {
   );
 };
 
-const toSafeNumber = (value) => {
+export const toSafeNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const toClockTime = (timestamp) => {
+export const toClockTime = (timestamp) => {
   try {
     return new Date(timestamp).toLocaleTimeString();
   } catch {
@@ -40,7 +40,7 @@ const toClockTime = (timestamp) => {
   }
 };
 
-const buildReadableAlertSummary = (alert) => {
+export const buildReadableAlertSummary = (alert) => {
   const details = alert?.details || {};
   const sentences = [];
 
@@ -84,7 +84,7 @@ const buildReadableAlertSummary = (alert) => {
   return sentences.join(' ');
 };
 
-const buildTodaysAlertsContext = async () => {
+export const buildTodaysAlertsContext = async () => {
   try {
     const history = await getGeoFenceAlertHistory();
     const todayItems = history
@@ -115,7 +115,7 @@ const buildTodaysAlertsContext = async () => {
  * @param {number} longitude - User's longitude
  * @returns {Promise<string>} Formatted SOS message
  */
-const generateSOSMessage = async (latitude, longitude) => {
+export const generateSOSMessage = async (latitude, longitude) => {
   const googleMapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
   const detailsBlock = await buildTodaysAlertsContext();
 
@@ -129,7 +129,7 @@ const generateSOSMessage = async (latitude, longitude) => {
  * @param {string} message - Message to send
  * @returns {Promise<boolean>} True if successful
  */
-const sendWhatsAppMessage = async (phoneNumber, contactName, message) => {
+export const sendWhatsAppMessage = async (phoneNumber, contactName, message) => {
   try {
     const formattedPhone = formatPhoneForWhatsApp(phoneNumber);
     const encodedMessage = encodeURIComponent(message);

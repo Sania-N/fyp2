@@ -21,6 +21,7 @@ export default function DangerPopupModal() {
   const scaleAnim = useRef(new Animated.Value(0)).current;
   const timerIntervalRef = useRef(null);
   const sosTriggeredRef = useRef(false);
+  const countdownStartedRef = useRef(false);
 
   // Handle timer expiration - trigger SOS
   const handleTimerExpired = useCallback(async () => {
@@ -100,7 +101,8 @@ export default function DangerPopupModal() {
 
   // Timer countdown effect
   useEffect(() => {
-    if (isVisible && isCountingDown && timer > 0) {
+    if (isVisible && isCountingDown && timer > 0 && !timerIntervalRef.current) {
+      countdownStartedRef.current = true;
       timerIntervalRef.current = setInterval(() => {
         updateTimer((prevTime) => {
           const newTime = prevTime - 1;
@@ -117,10 +119,19 @@ export default function DangerPopupModal() {
       return () => {
         if (timerIntervalRef.current) {
           clearInterval(timerIntervalRef.current);
+          timerIntervalRef.current = null;
         }
+        countdownStartedRef.current = false;
       };
     }
-  }, [isVisible, isCountingDown, timer, updateTimer, handleTimerExpired]);
+    if (!isVisible || !isCountingDown || timer <= 0) {
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+        timerIntervalRef.current = null;
+      }
+      countdownStartedRef.current = false;
+    }
+  }, [isVisible, isCountingDown, updateTimer, handleTimerExpired]);
 
   const handleSafeButtonPress = () => {
     // User is safe - stop timer and hide modal

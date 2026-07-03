@@ -168,8 +168,8 @@ export default function RecordScreen() {
 
       Alert.alert(
         "Success",
-        uploadResult?.emotion
-          ? `Recording saved. ML result: ${uploadResult.emotion}`
+        uploadResult != null
+          ? `Recording saved. Panic: ${uploadResult?.panic ? 'YES' : 'NO'}`
           : "Recording saved. ML analysis will update when the backend is reachable."
       );
       setFrontImageUri(null);
@@ -186,7 +186,12 @@ export default function RecordScreen() {
           );
 
           // Call multimodal-predict to assess danger
-          const dangerAnalysis = await analyzeUserDangerLevel(uploadResult.confidence);
+          const dangerAnalysis = await analyzeUserDangerLevel(
+            uploadResult.confidence,
+            null,
+            { currentScreenOrFeature: 'RecordScreen.uploadRecording', triggerSource: 'recording_upload' },
+            uploadResult.emotion || null
+          );
           console.log(`🔍 Danger analysis: ${dangerAnalysis.risk_level}`);
 
           if (uploadResult.recordingId) {

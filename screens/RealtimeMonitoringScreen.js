@@ -348,6 +348,7 @@ const styles = StyleSheet.create({
   controlSection: {
     padding: 16,
     gap: 12,
+    marginBottom: 16,
   },
   startButton: {
     backgroundColor: '#4CAF50',
@@ -410,11 +411,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderRadius: 12,
     padding: 16,
+    marginBottom: 12,
   },
   metricsGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
+    gap: 12,
   },
   metricBox: {
     flex: 1,
@@ -445,13 +447,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderRadius: 12,
     padding: 16,
-    marginTop: 12,
   },
   triggerContainer: {
     backgroundColor: '#fff',
     borderRadius: 12,
     padding: 16,
-    marginTop: 12,
   },
   triggerEmpty: {
     color: '#777',
@@ -495,7 +495,7 @@ const styles = StyleSheet.create({
   },
   lastThreatSection: {
     paddingHorizontal: 16,
-    marginBottom: 12,
+    marginBottom: 16,
   },
   threatCard: {
     flexDirection: 'row',
@@ -532,7 +532,7 @@ const styles = StyleSheet.create({
   },
   historySection: {
     paddingHorizontal: 16,
-    marginBottom: 12,
+    marginBottom: 16,
   },
   historyHeader: {
     flexDirection: 'row',
@@ -542,7 +542,7 @@ const styles = StyleSheet.create({
   },
   emergencySection: {
     paddingHorizontal: 16,
-    marginBottom: 12,
+    marginBottom: 16,
   },
   emergencyButton: {
     backgroundColor: '#FF0000',

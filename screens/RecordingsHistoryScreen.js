@@ -43,6 +43,7 @@ export default function RecordingsHistoryScreen() {
   const [photoModalVisible, setPhotoModalVisible] = useState(false);
   const [selectedPhoto, setSelectedPhoto] = useState(null);
   const [savingPhoto, setSavingPhoto] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
 
   const soundRef = useRef(null);
 
@@ -76,6 +77,17 @@ export default function RecordingsHistoryScreen() {
       const date = ts?.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
       const options = { day: "numeric", month: "short", year: "numeric" };
       return date.toLocaleDateString("en-GB", options);
+    } catch {
+      return "";
+    }
+  };
+
+  const formatTime = (ts) => {
+    try {
+      if (!ts) return "";
+      const date = ts?.seconds ? new Date(ts.seconds * 1000) : new Date(ts);
+      const options = { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true };
+      return date.toLocaleTimeString("en-GB", options);
     } catch {
       return "";
     }
@@ -146,8 +158,17 @@ export default function RecordingsHistoryScreen() {
         onPress: async () => {
           try {
             setDeleting(true);
-            // pass front & back URLs (may be undefined) so service can remove them
-            await deleteRecording(item.id, item.filename, item.audio_url, item.front_image_url, item.back_image_url);
+            // Pass storage paths if available (new method), fallback to URLs for older recordings
+            await deleteRecording(
+              item.id, 
+              item.filename, 
+              item.audio_url, 
+              item.front_image_url, 
+              item.back_image_url,
+              item.audio_storage_path,         // ✅ NEW
+              item.front_image_storage_path,   // ✅ NEW
+              item.back_image_storage_path     // ✅ NEW
+            );
             Alert.alert("Success", "Recording deleted successfully");
             setExpandedId(null);
           } catch (err) {
@@ -188,6 +209,13 @@ export default function RecordingsHistoryScreen() {
 
   const toggleExpand = (id) => {
     setExpandedId(expandedId === id ? null : id);
+  };
+
+  const getFilteredRecordings = () => {
+    if (!searchQuery.trim()) return recordings;
+    return recordings.filter((recording) =>
+      recording.filename.toLowerCase().includes(searchQuery.toLowerCase())
+    );
   };
 
   const openPhotoModal = (photoUri) => {
@@ -234,7 +262,7 @@ export default function RecordingsHistoryScreen() {
         <View style={styles.cardTop}>
           <View style={styles.recordingInfo}>
             <Text style={styles.recordingName}>{item.filename}</Text>
-            <Text style={styles.time}>{formatDate(item.created_at)}</Text>
+            <Text style={styles.time}>{formatDate(item.created_at)} • {formatTime(item.created_at)}</Text>
           </View>
           <Text style={styles.duration}>{formatDuration(item.duration)}</Text>
         </View>
@@ -325,7 +353,23 @@ export default function RecordingsHistoryScreen() {
 
       <View style={styles.container}>
         <Text style={styles.title}>All Recordings</Text>
-        <FlatList data={recordings} keyExtractor={(item) => item.id} renderItem={renderItem} ListEmptyComponent={<Text style={styles.emptyText}>No recordings found.</Text>} showsVerticalScrollIndicator={false} />
+        <View style={styles.searchContainer}>
+          <Ionicons name="search" size={20} color="rgba(255, 255, 255, 0.6)" style={styles.searchIcon} />
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search recordings..."
+            placeholderTextColor="rgba(255, 255, 255, 0.5)"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity onPress={() => setSearchQuery("")}
+              style={styles.clearButton}>
+              <Ionicons name="close" size={20} color="rgba(255, 255, 255, 0.6)" />
+            </TouchableOpacity>
+          )}
+        </View>
+        <FlatList data={getFilteredRecordings()} keyExtractor={(item) => item.id} renderItem={renderItem} ListEmptyComponent={<Text style={styles.emptyText}>No recordings found.</Text>} showsVerticalScrollIndicator={false} />
       </View>
 
       {/* Rename Modal */}
@@ -414,6 +458,28 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#fff",
     marginBottom: 20,
+  },
+  searchContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
+    borderRadius: 10,
+    marginBottom: 16,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255, 200, 220, 0.3)",
+  },
+  searchIcon: {
+    marginRight: 8,
+  },
+  searchInput: {
+    flex: 1,
+    paddingVertical: 12,
+    fontSize: 16,
+    color: "#fff",
+  },
+  clearButton: {
+    padding: 4,
   },
   centerContainer: {
     flex: 1,

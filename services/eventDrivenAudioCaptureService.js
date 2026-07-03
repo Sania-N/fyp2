@@ -34,6 +34,27 @@ async function getNetworkState() {
   return { isConnected: true };
 }
 
+function serializeLog(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (error) {
+    return JSON.stringify({ serializationError: error?.message || String(error) }, null, 2);
+  }
+}
+
+function calculateMotionFromTelemetry(telemetry = {}) {
+  const roll = Number(telemetry.roll) || 0;
+  const pitch = Number(telemetry.pitch) || 0;
+  const dampedYaw = (Number(telemetry.yaw) || 0) * 0.35;
+  const motionMagnitude = Math.sqrt(
+    roll * roll +
+    pitch * pitch +
+    dampedYaw * dampedYaw
+  );
+
+  return Math.min(10, motionMagnitude / 5);
+}
+
 export class EventDrivenAudioCaptureService {
   constructor() {
     this.recording = null;
@@ -214,9 +235,30 @@ export class EventDrivenAudioCaptureService {
    * @param {function} onSuccess - Callback with threat result
    * @param {function} onError - Error callback
    */
-  async captureAndAnalyze(userUid, currentTelemetry, onSuccess, onError) {
+  async captureAndAnalyze(userUid, currentTelemetry, onSuccess, onError, debugContext = {}) {
     try {
       console.log('🔴 [AudioCapture] Threat trigger detected! Starting capture...');
+
+      const captureStatus = this.getStatus();
+      console.log('[RealtimeThreat][STEP 1] Realtime check started');
+      console.log(serializeLog({
+        timestamp: new Date().toISOString(),
+        currentScreenOrFeature: debugContext.currentScreenOrFeature || 'eventDrivenAudioCaptureService.captureAndAnalyze',
+        triggerSource: debugContext.triggerSource || 'unknown',
+        captureArmed: Boolean(debugContext.captureArmed),
+        audioCaptureActive: Boolean(captureStatus?.isRecording),
+        currentSensorSnapshot: debugContext.currentSensorSnapshot || {
+          heartRate: currentTelemetry?.heartRate || 0,
+          roll: currentTelemetry?.roll || 0,
+          pitch: currentTelemetry?.pitch || 0,
+          yaw: currentTelemetry?.yaw || 0,
+          audioLevel: currentTelemetry?.audioLevel || 0,
+          fingerOn: currentTelemetry?.fingerOn,
+          spo2: currentTelemetry?.spo2,
+        },
+        triggerDecision: debugContext.triggerDecision || null,
+        recordingId: debugContext.recordingId || null,
+      }));
 
       // Process any pending analyses (non-blocking)
       this.processPendingAnalyses().catch(err => console.warn('[AudioCapture] processPendingAnalyses error:', err));
@@ -246,10 +288,32 @@ export class EventDrivenAudioCaptureService {
       console.log('🚨 [AudioCapture] Processing threat...');
       const threatResult = await this.callThreatDetectionAPI(
         audioUrl,
-        currentTelemetry
+        currentTelemetry,
+        {
+          ...debugContext,
+          currentSensorSnapshot: debugContext.currentSensorSnapshot || currentTelemetry,
+        }
       );
 
       console.log('✅ [AudioCapture] Threat analysis complete:', threatResult);
+
+      console.log('[RealtimeThreat][FINAL SUMMARY]');
+      console.log(serializeLog({
+        timestamp: new Date().toISOString(),
+        wasThreatDetected: Boolean(threatResult?.risk_level && ['DANGER', 'HIGH', 'THREAT', 'SUSPICIOUS', '1'].includes(String(threatResult.risk_level).trim().toUpperCase())),
+        wasCaptureTriggered: true,
+        wasUploadSkipped: false,
+        exactConditionThatDecidedIt: debugContext.triggerReason || debugContext.requestReason || 'Threat-triggered capture path completed',
+        triggerSource: debugContext.triggerSource || 'unknown',
+        recordingId: debugContext.recordingId || null,
+        emotion: threatResult?.emotion ?? null,
+        confidence: threatResult?.confidence ?? null,
+        panic: threatResult?.panic ?? null,
+        risk_level: threatResult?.risk_level ?? null,
+        motion_used: threatResult?.motion ?? null,
+        heart_rate_used: threatResult?.heart_rate ?? null,
+        trigger_reason: debugContext.requestReason || debugContext.triggerReason || null,
+      }));
 
       if (onSuccess) {
         onSuccess(threatResult);
@@ -271,17 +335,49 @@ export class EventDrivenAudioCaptureService {
    * @param {object} telemetry - Current sensor state
    * @returns {Promise<object>} Threat analysis result
    */
-  async callThreatDetectionAPI(audioUrl, telemetry) {
+  async callThreatDetectionAPI(audioUrl, telemetry, debugContext = {}) {
     try {
       const { API_BASE_URL } = require('../api');
 
       // Calculate motion from IMU
+      const dampedYaw = (Number(telemetry.yaw) || 0) * 0.35;
       const motionMagnitude = Math.sqrt(
-        telemetry.roll * telemetry.roll +
-        telemetry.pitch * telemetry.pitch +
-        telemetry.yaw * telemetry.yaw
+        (Number(telemetry.roll) || 0) * (Number(telemetry.roll) || 0) +
+        (Number(telemetry.pitch) || 0) * (Number(telemetry.pitch) || 0) +
+        dampedYaw * dampedYaw
       );
       const motion = Math.min(10, motionMagnitude / 5);
+      const heartRateValue = Number(telemetry.heartRate);
+      const heartRate = Number.isFinite(heartRateValue) && heartRateValue > 0 ? heartRateValue : 0;
+      const requestUrl = `${API_BASE_URL}/realtime-threat`;
+      const requestHeaders = {
+        'Content-Type': 'application/json',
+        'x-trigger-source': 'realtime',
+        'x-realtime': 'true',
+      };
+      const requestBody = {
+        audio_url: audioUrl,
+        motion,
+        heart_rate: heartRate,
+        trigger_reason: debugContext.requestReason || debugContext.triggerReason || 'event_driven_capture',
+      };
+
+      console.log('[RealtimeThreat][STEP 2] Right before the request is sent');
+      console.log(serializeLog({
+        timestamp: new Date().toISOString(),
+        endpointUrl: requestUrl,
+        requestHeaders,
+        fullRequestBody: requestBody,
+        localComputedValues: {
+          motionMagnitude,
+          motion,
+          heartRateValue,
+          heartRate,
+          hasTelemetry: Boolean(telemetry),
+          debugContext,
+        },
+        exactReasonRequestIsBeingSent: debugContext.requestReason || debugContext.triggerReason || 'Threat-triggered realtime capture requires combined analysis',
+      }));
 
       // Helper: fetch with timeout + retries + exponential backoff
       const fetchWithTimeout = (url, options, timeoutMs = 12000) => {
@@ -312,28 +408,43 @@ export class EventDrivenAudioCaptureService {
 
       // Single backend call: /realtime-threat does audio emotion + multimodal analysis together.
       console.log('📊 [AudioCapture] Calling /realtime-threat for combined analysis... (timeout: 12s)');
-      console.log('🔗 [AudioCapture] API URL:', `${API_BASE_URL}/realtime-threat`);
-      const combinedRes = await fetchWithRetry(`${API_BASE_URL}/realtime-threat`, {
+      console.log('🔗 [AudioCapture] API URL:', requestUrl);
+      const requestStartAt = Date.now();
+      const combinedRes = await fetchWithRetry(requestUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-trigger-source': 'realtime',
-          'x-realtime': 'true',
-        },
-        body: JSON.stringify({
-          audio_url: audioUrl,
-          motion,
-          heart_rate: telemetry.heartRate,
-          trigger_reason: 'event_driven_capture',
-        }),
+        headers: requestHeaders,
+        body: JSON.stringify(requestBody),
       }, 3, 800);
+
+      const responseTimeMs = Date.now() - requestStartAt;
+      const rawResponseBody = await combinedRes.text();
+      let parsedResponse = null;
+      let parsingError = null;
+      try {
+        parsedResponse = rawResponseBody ? JSON.parse(rawResponseBody) : null;
+      } catch (error) {
+        parsingError = error?.message || String(error);
+      }
+
+      console.log('[RealtimeThreat][STEP 3] Right after the request returns');
+      console.log(serializeLog({
+        timestamp: new Date().toISOString(),
+        httpStatusCode: combinedRes.status,
+        responseTimeMs,
+        rawResponseBody,
+        parsedJsonResponse: parsedResponse,
+        parsingError,
+      }));
 
       if (!combinedRes.ok) {
         console.error(`❌ [AudioCapture] /realtime-threat returned status ${combinedRes.status}`);
         throw new Error(`Threat detection failed (${combinedRes.status})`);
       }
-      const threatData = await combinedRes.json();
-      console.log('✅ [AudioCapture] Threat result received:', threatData.risk_level);
+      if (parsingError) {
+        throw new Error(`Threat detection response parsing failed: ${parsingError}`);
+      }
+      const threatData = parsedResponse;
+      console.log('✅ [AudioCapture] Threat result received:', threatData?.risk_level);
 
       // Combine results
       return {
@@ -395,7 +506,7 @@ export class EventDrivenAudioCaptureService {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               emotion_confidence: emotionData.confidence,
-              motion: job.telemetry.motion || 0,
+              motion: calculateMotionFromTelemetry(job.telemetry),
               heart_rate: job.telemetry.heartRate,
             }),
           });

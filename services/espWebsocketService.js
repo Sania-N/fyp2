@@ -121,8 +121,13 @@ class EspWebsocketService {
     return out;
   }
 
-  async captureAndUpload(userUid, frontImageUri = null, backImageUri = null, telemetryOverride = null) {
+  async captureAndUpload(userUid, frontImageUri = null, backImageUri = null, telemetryOverride = null, captureContext = {}) {
     if (!this.ringBuffer) throw new Error('No audio buffer available');
+
+    if (captureContext && captureContext.captureAllowed === false) {
+      console.log('[ESP WS] Capture blocked by trigger gate:', captureContext);
+      throw new Error('Capture blocked: trigger gate did not allow upload');
+    }
 
     const bufferedSeconds = (this.samplesWritten || 0) / SAMPLE_RATE;
     if (bufferedSeconds < MIN_CAPTURE_SECONDS) {
@@ -186,7 +191,8 @@ class EspWebsocketService {
       totalSamples.length / SAMPLE_RATE,
       telemetryForUpload,
       frontImageUri,
-      backImageUri
+      backImageUri,
+      captureContext
     );
     // cleanup
     try { await FileSystem.deleteAsync(uri); } catch (e) {}

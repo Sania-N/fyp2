@@ -18,19 +18,17 @@ export class ThreatTriggerService {
 
     // Thresholds (relative to baseline)
     this.hrSpikeThreshold = 25; // bpm above baseline
-    // Motion thresholds are on a 0-10 normalized scale (see calculateMotionFromIMU)
-    // Lowered for higher sensitivity to smaller movements
-    this.motionAbnormalThreshold = 3; // 0-10 scale (more sensitive)
-    // Require a smaller sudden change to catch quick small movements (0-10 scale)
-    this.motionDeltaThreshold = 1.0; // normalized change within short interval
+    // Accel jerk detection uses raw accelerometer deviation from 1.0g.
+    // Typical sudden jerk / impact values are in the ~0.0-2.0+ g range.
+    this.accelJerkThreshold = 0.3; // g's
     this.loudSoundThreshold = 70; // 0-100 audio level scale
 
     // Debouncing (avoid single-reading false positives)
     // Use separate requirements per signal: HR needs more consecutive confirmations,
     // motion and sound can be fewer readings to stay responsive.
     this.consecutiveReadingsRequiredHr = 5;
-    // Make motion responsive: single confirmation is enough
-    this.consecutiveReadingsRequiredMotion = 1;
+    // Require more than one sample to avoid one-off IMU spikes
+    this.consecutiveReadingsRequiredMotion = 2;
     this.consecutiveReadingsRequiredSound = 2;
     this.triggerCounts = {
       hr_spike: 0,
@@ -41,9 +39,9 @@ export class ThreatTriggerService {
     // Cooldown (don't trigger too frequently)
     this.lastTriggerTime = 0;
     this.triggerCooldownMs = 5000; // 5 seconds between triggers
-    // Track last motion magnitude/time to detect deltas
-    this.lastMotionMagnitude = 0;
-    this.lastMotionAt = 0;
+    // Let the sensor settle before motion triggers are allowed
+    this.motionSamplesSeen = 0;
+    this.motionWarmupSamples = 4;
     // Inhibition state to temporarily ignore triggers while processing a capture
     this.inhibited = false;
     this._inhibitTimeout = null;
@@ -52,6 +50,28 @@ export class ThreatTriggerService {
     this.defaultInhibitMs = 20000; // 20s
     // Track last heart rate reading to detect sudden jumps
     this.lastHeartRate = null;
+    this.lastDecisionDebug = null;
+    this.lastNoTriggerLogAt = 0;
+  }
+
+  /**
+   * Normalize IMU values into a conservative 0-10 motion score.
+   * Yaw is damped because it tends to drift even when the device is still.
+   */
+  getNormalizedMotion(telemetry) {
+    if (!telemetry) return 0;
+
+    const roll = Number(telemetry.roll) || 0;
+    const pitch = Number(telemetry.pitch) || 0;
+    const yaw = (Number(telemetry.yaw) || 0) * 0.35;
+
+    const rawMotion = Math.sqrt(
+      roll * roll +
+      pitch * pitch +
+      yaw * yaw
+    );
+
+    return Math.min(10, rawMotion / 5);
   }
 
   /**
@@ -159,24 +179,14 @@ export class ThreatTriggerService {
     }
 
     // ═══════════════════════════════════════════
-    // TRIGGER B: Motion Abnormality (use normalized 0-10 motion)
+    // TRIGGER B: Motion Abnormality (use raw accelJerk from firmware)
     // ═══════════════════════════════════════════
-    const rawMotion = Math.sqrt(
-      (telemetry.roll || 0) * (telemetry.roll || 0) +
-      (telemetry.pitch || 0) * (telemetry.pitch || 0) +
-      (telemetry.yaw || 0) * (telemetry.yaw || 0)
-    );
+    const accelJerk = Number(telemetry?.accelJerk) || 0;
 
-    // Normalize to 0-10 (same logic as dangerDetectionService.calculateMotionFromIMU)
-    const motionMagnitude = Math.min(10, rawMotion / 5);
+    this.motionSamplesSeen += 1;
 
-    // Compute delta since last sample (normalized scale)
-    const now = Date.now();
-    const delta = Math.abs(motionMagnitude - (this.lastMotionMagnitude || 0));
-    const deltaMs = now - (this.lastMotionAt || now);
-
-    const suddenChange = delta >= this.motionDeltaThreshold && deltaMs < 2000; // within 2s
-    const motionAbnormal = motionMagnitude > this.motionAbnormalThreshold && suddenChange;
+    const motionReady = this.motionSamplesSeen >= this.motionWarmupSamples;
+    const motionAbnormal = motionReady && accelJerk >= this.accelJerkThreshold;
 
     if (motionAbnormal) {
       this.triggerCounts.motion_abnormal++;
@@ -187,18 +197,13 @@ export class ThreatTriggerService {
     if (this.triggerCounts.motion_abnormal >= this.consecutiveReadingsRequiredMotion) {
       triggers.push({
         type: 'MOTION_ABNORMAL',
-        value: motionMagnitude,
-        threshold: this.motionAbnormalThreshold,
-        delta: delta,
+        value: accelJerk,
+        threshold: this.accelJerkThreshold,
         severity: 'MEDIUM',
-        description: `Motion detected: ${motionMagnitude.toFixed(2)} (delta ${delta.toFixed(2)}, threshold: ${this.motionAbnormalThreshold})`,
+        description: `Motion jerk detected: ${accelJerk.toFixed(3)}g (threshold: ${this.accelJerkThreshold}g)`,
       });
-      console.log(`⚠️ [ThreatTrigger] MOTION_ABNORMAL detected: ${motionMagnitude.toFixed(2)} (delta ${delta.toFixed(2)})`);
+      console.log(`⚠️ [ThreatTrigger] MOTION_ABNORMAL detected: ${accelJerk.toFixed(3)}g`);
     }
-
-    // Update last motion tracking (store normalized value)
-    this.lastMotionMagnitude = motionMagnitude;
-    this.lastMotionAt = now;
 
     // Update last heart rate reading for next delta calculation
     if (validHeartRate !== null) {
@@ -263,19 +268,60 @@ export class ThreatTriggerService {
    * @param {array} triggers - Array of detected triggers
    * @returns {string|null} "HIGH", "MEDIUM", or null
    */
-  shouldCaptureAudio(triggers) {
-    if (triggers.length === 0) return null;
+  shouldCaptureAudio(triggers, debugContext = {}) {
+    const now = Date.now();
+    const cooldownRemainingMs = Math.max(0, this.triggerCooldownMs - (now - this.lastTriggerTime));
+
+    if (triggers.length === 0) {
+      this.lastDecisionDebug = {
+        timestamp: new Date().toISOString(),
+        decision: null,
+        reason: 'No triggers detected',
+        triggerCount: 0,
+        triggerTypes: [],
+        cooldownRemainingMs,
+        triggerCounts: { ...this.triggerCounts },
+        inhibited: this.inhibited,
+        debugContext,
+      };
+      if (now - this.lastNoTriggerLogAt >= 10000) {
+        console.log('ℹ️ [ThreatTrigger] shouldCaptureAudio -> null (no triggers)', this.lastDecisionDebug);
+        this.lastNoTriggerLogAt = now;
+      }
+      return null;
+    }
 
     // Check cooldown to avoid too frequent captures
-    const now = Date.now();
     if (now - this.lastTriggerTime < this.triggerCooldownMs) {
-      console.log('⏳ [ThreatTrigger] In cooldown period, skipping capture');
+      this.lastDecisionDebug = {
+        timestamp: new Date().toISOString(),
+        decision: null,
+        reason: 'Cooldown active',
+        triggerCount: triggers.length,
+        triggerTypes: triggers.map((trigger) => trigger.type),
+        cooldownRemainingMs,
+        triggerCounts: { ...this.triggerCounts },
+        inhibited: this.inhibited,
+        debugContext,
+      };
+      console.log('⏳ [ThreatTrigger] shouldCaptureAudio -> null (cooldown active)', this.lastDecisionDebug);
       return null;
     }
 
     // Multi-trigger logic
     if (triggers.length >= 2) {
-      console.log('🔴 [ThreatTrigger] MULTIPLE TRIGGERS - HIGH confidence threat');
+      this.lastDecisionDebug = {
+        timestamp: new Date().toISOString(),
+        decision: 'HIGH',
+        reason: 'Multiple triggers detected',
+        triggerCount: triggers.length,
+        triggerTypes: triggers.map((trigger) => trigger.type),
+        cooldownRemainingMs: 0,
+        triggerCounts: { ...this.triggerCounts },
+        inhibited: this.inhibited,
+        debugContext,
+      };
+      console.log('🔴 [ThreatTrigger] shouldCaptureAudio -> HIGH (multiple triggers)', this.lastDecisionDebug);
       this.lastTriggerTime = now;
       return 'HIGH';
     }
@@ -285,18 +331,69 @@ export class ThreatTriggerService {
       
       // Single loud sound alone is not enough (false positive prone)
       if (trigger.type === 'LOUD_SOUND') {
-        console.log('⚠️ [ThreatTrigger] Single LOUD_SOUND - MEDIUM confidence (could be dog bark, music)');
-        this.lastTriggerTime = now;
-        return 'MEDIUM';
+        this.lastDecisionDebug = {
+          timestamp: new Date().toISOString(),
+          decision: null,
+          reason: 'Single LOUD_SOUND trigger ignored to reduce false positives',
+          triggerCount: 1,
+          triggerTypes: [trigger.type],
+          cooldownRemainingMs: 0,
+          triggerCounts: { ...this.triggerCounts },
+          inhibited: this.inhibited,
+          debugContext,
+        };
+        console.log('ℹ️ [ThreatTrigger] shouldCaptureAudio -> null (single loud sound ignored)', this.lastDecisionDebug);
+        return null;
       }
 
       // HR spike or motion abnormal alone is worth checking
-      console.log(`⚠️ [ThreatTrigger] Single ${trigger.type} - MEDIUM confidence`);
+      this.lastDecisionDebug = {
+        timestamp: new Date().toISOString(),
+        decision: 'MEDIUM',
+        reason: `Single ${trigger.type} trigger`,
+        triggerCount: 1,
+        triggerTypes: [trigger.type],
+        cooldownRemainingMs: 0,
+        triggerCounts: { ...this.triggerCounts },
+        inhibited: this.inhibited,
+        debugContext,
+      };
+      console.log(`⚠️ [ThreatTrigger] shouldCaptureAudio -> MEDIUM (single ${trigger.type})`, this.lastDecisionDebug);
       this.lastTriggerTime = now;
       return 'MEDIUM';
     }
 
+    this.lastDecisionDebug = {
+      timestamp: new Date().toISOString(),
+      decision: null,
+      reason: 'No capture condition matched',
+      triggerCount: triggers.length,
+      triggerTypes: triggers.map((trigger) => trigger.type),
+      cooldownRemainingMs,
+      triggerCounts: { ...this.triggerCounts },
+      inhibited: this.inhibited,
+      debugContext,
+    };
     return null;
+  }
+
+  getLastDecisionDebug() {
+    return this.lastDecisionDebug;
+  }
+
+  getDebugState() {
+    const now = Date.now();
+    return {
+      timestamp: new Date().toISOString(),
+      inhibited: this.inhibited,
+      isCalibrated: this.isCalibrated,
+      baselineHR: this.baselineHR,
+      lastTriggerTime: this.lastTriggerTime,
+      triggerCooldownMs: this.triggerCooldownMs,
+      cooldownRemainingMs: Math.max(0, this.triggerCooldownMs - (now - this.lastTriggerTime)),
+      triggerCounts: { ...this.triggerCounts },
+      lastDecisionDebug: this.lastDecisionDebug,
+    };
   }
 
   /**
@@ -307,19 +404,19 @@ export class ThreatTriggerService {
     switch (context) {
       case 'safe_zone':
         this.hrSpikeThreshold = 30; // Higher threshold (less sensitive)
-        this.motionAbnormalThreshold = 35;
+        this.motionJerkThreshold = 2.9;
         console.log('🟢 [ThreatTrigger] Safe zone thresholds applied');
         break;
 
       case 'risky_zone':
         this.hrSpikeThreshold = 20; // Lower threshold (more sensitive)
-        this.motionAbnormalThreshold = 25;
+        this.motionJerkThreshold = 2.4;
         console.log('🟡 [ThreatTrigger] Risky zone thresholds applied');
         break;
 
       case 'very_risky_zone':
         this.hrSpikeThreshold = 15; // Very low threshold (very sensitive)
-        this.motionAbnormalThreshold = 20;
+        this.motionJerkThreshold = 1.8;
         console.log('🔴 [ThreatTrigger] Very risky zone thresholds applied');
         break;
 

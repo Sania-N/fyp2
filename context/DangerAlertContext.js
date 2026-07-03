@@ -10,10 +10,16 @@ export const DangerAlertProvider = ({ children }) => {
   });
 
   const showDangerAlert = useCallback(() => {
-    setDangerAlertState({
-      isVisible: true,
-      timer: 60,
-      isCountingDown: true,
+    setDangerAlertState((prev) => {
+      if (prev.isVisible) {
+        return prev;
+      }
+
+      return {
+        isVisible: true,
+        timer: 60,
+        isCountingDown: true,
+      };
     });
   }, []);
 
